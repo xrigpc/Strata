@@ -5,10 +5,14 @@
 #include <algorithm>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <future>
+#include <iterator>
 #include <mutex>
+#include <new>
+#include <stdexcept>
 #include <string>
 #include <utility>
 #include <vector>
@@ -210,6 +214,22 @@ int main() {
         check(tier.best(prompt_of(450, 5000), {}, false).tokens == 0, "b is gone from the tier");
     }
 
+    {   // xrig fix #3: a write that throws on the writer thread (here the test hook throws std::bad_alloc, as RAM
+        // pressure would) drops that job only: no std::terminate, its waiters woken, and the next write goes through
+        int calls = 0;   // the writer's thread only (wait_idle orders it)
+        auto o = opts(dir, GiB);
+        o.before_write = [&calls] { if (++calls == 1) throw std::bad_alloc(); };
+        ConversationDiskTier tier(std::move(o));
+        check(tier.open(e) && tier.put(image(400, 34)), "throwing write: queued");
+        tier.wait_idle();
+        check(!tier.pending() && tier.size() == 0 && tier_files(dir) == 0 && tier.stats().write_failed == 1 &&
+              logged("the write threw"), "throwing write: dropped, counted and logged; the queue is not blocked");
+        check(tier.best(prompt_of(450), {}, false).tokens == 0, "throwing write: nothing matches it");
+        check(tier.put(image(400, 35, 7000)), "throwing write: the next one is queued");
+        tier.wait_idle();
+        check(tier.size() == 1 && tier.stats().written == 1 && tier_files(dir) == 1, "throwing write: the writer runs on");
+    }
+
     {   // #879: clear() takes the conversations on the disk, their files too
         ConversationDiskTier tier(opts(dir, GiB));
         check(tier.open(e) && tier.put(image(400, 40)), "clear: put a");
@@ -236,16 +256,58 @@ int main() {
     }
     check(tier_files(dir) == 0, "the tier removes its files when it ends");
 
-    {   // a read the RAM preflight refuses: nothing restored, the files are gone anyway
+    {   // xrig fix #4: a read the RAM preflight refuses: nothing restored, but the entry and its files stay (put back
+        // as the newest), and a later read with room gives the conversation back exactly
         ConversationDiskTier tier(opts(dir, GiB));
         check(tier.open(e) && tier.put(split_image(400, 10)), "put for a refused read");
         tier.wait_idle();
         const auto m = tier.best(prompt_of(450), {}, false);
         SavedConversation back;
-        const bool ok = tier.take(m.id, m.tokens, back, e, [](uint64_t, std::string& why) { why = "no RAM"; return false; });
-        check(!ok && back.kv.empty() && back.stage_images.empty() && tier.size() == 0 && tier_files(dir) == 0,
-              "refused read: empty image, entry and files gone");
+        bool kept = false;
+        const bool ok = tier.take(m.id, m.tokens, back, e,
+                                  [](uint64_t, std::string& why) { why = "no RAM"; return false; }, nullptr, &kept);
+        check(!ok && kept && back.kv.empty() && back.stage_images.empty(), "refused read: empty image, kept");
+        check(tier.size() == 1 && tier.bytes() > 0 && tier_files(dir) == 2 && logged("kept on the disk"),
+              "refused read: the entry and its files stay");
         check(tier.stats().read_failed == 1, "a failed read is counted");
+        const auto again = tier.best(prompt_of(450), {}, false);
+        check(again.id == m.id && again.tokens == 400, "refused read: it still matches");
+        check(tier.take(again.id, again.tokens, back, e, {}, nullptr, &kept) && !kept && same(back, split_image(400, 10)),
+              "refused read: a later read gives it back exactly");
+        check(tier.size() == 0 && tier.bytes() == 0 && tier_files(dir) == 0, "refused read: then the entry and files go");
+    }
+
+    {   // xrig fix #4: #879's clear() during a read (here from inside the RAM check, which runs without the lock) wins:
+        // the refused read does not put its entry back, and its files go
+        ConversationDiskTier tier(opts(dir, GiB));
+        check(tier.open(e) && tier.put(image(400, 12)), "clear during a read: put");
+        tier.wait_idle();
+        const auto m = tier.best(prompt_of(450), {}, false);
+        SavedConversation back;
+        bool kept = true;
+        auto admit = [&](uint64_t, std::string& why) { tier.clear(); why = "no RAM"; return false; };
+        check(!tier.take(m.id, m.tokens, back, e, admit, nullptr, &kept) && !kept, "clear during a read: not kept");
+        check(tier.size() == 0 && tier.bytes() == 0 && tier_files(dir) == 0, "clear during a read: entry and files gone");
+    }
+
+    {   // xrig fix #4: what the budget let in while a refused read ran goes first when its entry comes back (the one
+        // just asked for is the newest)
+        ConversationDiskTier tier(opts(dir, 25ull << 20));   // one ~17 MiB image, not two
+        check(tier.open(e) && tier.put(image(400, 13)), "budget during a read: put a");
+        tier.wait_idle();
+        const auto m = tier.best(prompt_of(450), {}, false);
+        SavedConversation back;
+        bool kept = false;
+        auto admit = [&](uint64_t, std::string& why) {
+            check(tier.put(image(400, 14, 7000)), "budget during a read: put b");   // a is out of the list: no eviction
+            tier.wait_idle();
+            why = "no RAM";
+            return false;
+        };
+        check(!tier.take(m.id, m.tokens, back, e, admit, nullptr, &kept) && kept, "budget during a read: a kept");
+        check(tier.size() == 1 && tier_files(dir) == 1 && tier.bytes() <= (25ull << 20) &&
+              tier.best(prompt_of(450), {}, false).tokens == 400 && tier.best(prompt_of(450, 7000), {}, false).tokens == 0,
+              "budget during a read: b went for the budget, a stays");
     }
 
     {   // put_streamed: the K/V read from where it lives (here: the image's own buffers) gives the same files
@@ -277,6 +339,15 @@ int main() {
         SavedConversation back;
         check(m.tokens == 500 && tier.take(m.id, m.tokens, back, e) && same(back, expect),
               "put_streamed: read back exactly the image the sources came from");
+        // xrig fix #3: a K/V source that throws while the second stage's file is written: false instead of the
+        // exception, the first stage's file (and the partial one) removed, counted, and `meta` still given back
+        std::vector<std::vector<SessionKvSource>> throwing = sources;
+        throwing[1][0].read = [](size_t, size_t, void*, size_t) -> bool { throw std::runtime_error("injected"); };
+        const size_t failed_before = tier.stats().write_failed;
+        check(!tier.put_streamed(meta, throwing), "put_streamed: a throwing source is a failed write");
+        check(meta.stage_images.size() == 1 && meta.checkpoints.size() == 2, "put_streamed: given back after a throw");
+        check(tier.size() == 0 && tier_files(dir) == 0 && tier.stats().write_failed == failed_before + 1 &&
+              logged("threw: injected"), "put_streamed: no file left after a throw; counted and logged");
     }
 
     {   // take with K/V targets: the files' K/V streamed into them (here: CPU buffers), the rest in `out`
@@ -313,6 +384,10 @@ int main() {
         std::vector<std::vector<SessionKvTarget>> kv = {targets_for(expect, got0), targets_for(expect.stage_images[0], got1)};
         const auto m = tier.best(prompt_of(600, 11000), {}, false);
         SavedConversation meta;
+        bool kept = false;   // xrig fix #4: a streamed read the RAM check refuses keeps the entry too
+        check(!tier.take(m.id, m.tokens, meta, e, [](uint64_t, std::string& why) { why = "no RAM"; return false; }, &kv,
+                         &kept) && kept && tier.size() == 1 && tier_files(dir) == 2,
+              "streamed take: a refused RAM check keeps the entry and its files");
         check(m.tokens == 500 && !m.queued && m.bytes > 0 && tier.take(m.id, m.tokens, meta, e, {}, &kv),
               "streamed take: read");
         bool same_kv = true;
@@ -332,8 +407,9 @@ int main() {
         std::vector<std::vector<SessionKvTarget>> wrong = {targets_for(other, bad)};
         wrong[0][0].sizes[0] += 1;
         const auto m2 = tier.best(prompt_of(450, 12000), {}, false);
-        check(!tier.take(m2.id, m2.tokens, meta, e, {}, &wrong) && e.find("size differs") != std::string::npos,
+        check(!tier.take(m2.id, m2.tokens, meta, e, {}, &wrong, &kept) && e.find("size differs") != std::string::npos,
               "streamed take: a K/V part of another size is refused");
+        check(!kept && tier.size() == 0 && tier_files(dir) == 0, "streamed take: a refused file is not kept (xrig fix #4)");
     }
 
     {   // the RAM cache's evictions go to the disk tier (set_on_evict)
@@ -372,6 +448,10 @@ int main() {
             const auto m = tier.best(prompt_of(600), {}, false);
             check(m.tokens == 500 && m.live, "persist: matches after a restart");
             SavedConversation back;
+            bool kept = false;   // xrig fix #4: a refused RAM check keeps the index too
+            check(!tier.take(m.id, m.tokens, back, e, [](uint64_t, std::string& why) { why = "no RAM"; return false; },
+                             nullptr, &kept) && kept && tier.size() == 2 && tier_files(dir) == 5,
+                  "persist: a refused read keeps the images and the index");
             const bool read = tier.take(m.id, m.tokens, back, e);
             if (!read) std::fprintf(stderr, "take: %s\n", e.c_str());
             check(read, "persist: read back after a restart");
@@ -410,9 +490,97 @@ int main() {
             const auto m = tier.best(prompt_of(450, 6000), {}, false);
             check(m.tokens == 400, "persist: b matches by its index");
             SavedConversation back;
-            check(!tier.take(m.id, m.tokens, back, e) && back.kv.empty() && logged("hold another conversation"),
-                  "persist: a's image under b's index is refused, never restored as b");
+            bool kept = true;
+            check(!tier.take(m.id, m.tokens, back, e, {}, nullptr, &kept) && back.kv.empty() &&
+                  logged("hold another conversation"), "persist: a's image under b's index is refused, never restored as b");
+            check(!kept && tier.size() == 1, "persist: the mismatched entry is not kept (xrig fix #4)");
             check(tier.best(prompt_of(450), {}, false).tokens == 400, "persist: a is still there");
+        }
+    }
+
+    {   // xrig hardening: an index naming a file outside the folder (absolute or "..") is refused, and that file stays
+        auto persistent5 = [&] {
+            auto o = opts(dir, GiB);
+            o.persist = true;
+            o.identity = {5, 7};
+            return o;
+        };
+        const fs::path outside = dir.parent_path() / "strata-conv-outside-sentinel-0.bin";
+        touch(outside);
+        for (const std::string& evil : {outside.string(), std::string("../") + outside.filename().string()}) {
+            {
+                ConversationDiskTier tier(persistent5());
+                check(tier.open(e) && tier.put(image(300, 25)), "hardening: put");
+            }
+            for (const auto& f : fs::directory_iterator(dir)) {
+                if (f.path().extension() != ".idx") continue;
+                std::ifstream in(f.path(), std::ios::binary);
+                std::string b((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+                in.close();
+                const size_t at = 8 * 3 + 8 + 1 + 8 + 4;   // magic, model, config, time, cvec, bytes, file count
+                uint32_t n = 0;
+                std::memcpy(&n, b.data() + at, 4);
+                const uint32_t m = (uint32_t) evil.size();
+                b = b.substr(0, at) + std::string(reinterpret_cast<const char*>(&m), 4) + evil + b.substr(at + 4 + n);
+                std::ofstream out(f.path(), std::ios::binary | std::ios::trunc);
+                out.write(b.data(), (std::streamsize) b.size());
+            }
+            {
+                ConversationDiskTier tier(persistent5());
+                check(tier.open(e) && tier.size() == 0, "hardening: an index naming a path is refused");
+                tier.clear();
+            }
+            check(fs::exists(outside), "hardening: the file outside the folder is never deleted");
+        }
+        fs::remove(outside);
+    }
+
+    {   // xrig fix #5: the index is created private (0600, as the images are) under a random temporary name that
+        // does not stay behind; an oversized index or a link at an index's name is refused at start, and a link's
+        // target outside the folder is neither read nor deleted
+        auto persistent6 = [&] {
+            auto o = opts(dir, GiB);
+            o.persist = true;
+            o.identity = {6, 7};
+            return o;
+        };
+        {
+            ConversationDiskTier tier(persistent6());
+            check(tier.open(e) && tier.put(image(300, 26)), "fix #5: put");
+        }
+        fs::path idx;
+        size_t temps = 0;
+        for (const auto& f : fs::directory_iterator(dir)) {
+            if (f.path().extension() == ".idx") idx = f.path();
+            if (f.path().extension() == ".tmp") ++temps;
+        }
+        check(!idx.empty() && temps == 0, "fix #5: one index, no temporary file left");
+#ifndef _WIN32
+        const auto other = fs::perms::group_all | fs::perms::others_all;
+        check((fs::status(idx).permissions() & other) == fs::perms::none, "fix #5: the index is private (0600)");
+        for (const auto& f : fs::directory_iterator(dir))
+            if (f.path().extension() == ".bin")
+                check((fs::status(f.path()).permissions() & other) == fs::perms::none, "fix #5: the image is private");
+        check((fs::status(dir).permissions() & other) == fs::perms::none, "fix #5: the folder is private (0700)");
+        // a link at the index's name, to the real index moved outside the folder: refused, the target stays
+        const fs::path moved = dir.parent_path() / ("strata_conversation_disk_test_idx_" + std::to_string(std::rand()));
+        fs::rename(idx, moved);
+        fs::create_symlink(moved, idx);
+        {
+            ConversationDiskTier tier(persistent6());
+            check(tier.open(e) && tier.size() == 0 && tier_files(dir) == 0, "fix #5: a linked index is refused");
+        }
+        check(fs::exists(moved), "fix #5: the link's target is not deleted");
+        fs::remove(moved);
+#endif
+        // an index over the size cap (sparse: nothing is written) is refused without being read, and removed
+        const fs::path big = dir / (std::string(ConversationDiskTier::file_prefix()) + "0123-1.idx");
+        touch(big);
+        fs::resize_file(big, (64ull << 20) + 1);
+        {
+            ConversationDiskTier tier(persistent6());
+            check(tier.open(e) && tier.size() == 0 && !fs::exists(big),
+                  "fix #5: an index over 64 MiB is refused and removed");
         }
     }
 

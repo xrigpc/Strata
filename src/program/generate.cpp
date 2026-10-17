@@ -11095,6 +11095,8 @@ int main(int argc, char** argv) {
             std::optional<strata::core::SavedConversation> incoming;
             strata::core::ConversationDiskTier::Match stream;   // a disk conversation the RAM refuses whole (id 0: none)
             bool incoming_streamed = false;                      // incoming's K/V is already in the GPUs
+            // xrig fix: make_ram below may evict RAM entries (in either block), which moves parked.index
+            const size_t evictions_before = conversations.evictions();
             // the disk tier holds a longer prefix than the session, a --batch slot or the RAM cache: restore that one
             if (conv_disk.enabled()) {
                 const auto on_disk = conv_disk.best(ids, req_imgs, want_cvec);
@@ -11102,8 +11104,14 @@ int main(int argc, char** argv) {
                     const uint64_t floor = (uint64_t) o.conversation_cache_min_free_mib * 1024 * 1024;
                     size_t evicted = 0;
                     std::optional<strata::core::HostMemoryReading> room;
-                    // no room for the whole image: its K/V is streamed into the GPUs after the outgoing one is parked
-                    if (!on_disk.queued && !make_ram(on_disk.bytes, floor, evicted, room)) stream = on_disk;
+                    // no room for the whole image: its K/V is streamed into the GPUs after the outgoing one is parked.
+                    // xrig fix #4: probed with what the read's RAM preflight asks (session_read_peak_bytes: the image
+                    // plus the read buffer and the per-segment overhead; over all the files, at least what each one
+                    // asks), not the bare file bytes - a borderline image passed the probe, then failed the read's
+                    // admission and was lost instead of streamed.
+                    if (!on_disk.queued &&
+                        !make_ram(strata::core::session_read_peak_bytes(on_disk.bytes), floor, evicted, room))
+                        stream = on_disk;
                 }
                 if (stream.id == 0 && on_disk.tokens > std::max({resume, slot_tokens, parked.tokens})) {
                     const uint64_t floor = (uint64_t) o.conversation_cache_min_free_mib * 1024 * 1024;
@@ -11117,16 +11125,26 @@ int main(int argc, char** argv) {
                     strata::core::SavedConversation image;
                     std::string disk_err;
                     const auto d0 = Clock::now();
-                    if (conv_disk.take(on_disk.id, on_disk.tokens, image, disk_err, admit)) {
+                    bool kept = false;   // xrig fix #4: the read failed for want of RAM only; the entry is still there
+                    if (conv_disk.take(on_disk.id, on_disk.tokens, image, disk_err, admit, nullptr, &kept)) {
                         disk_read_ms = std::chrono::duration<double, std::milli>(Clock::now() - d0).count();
                         incoming.emplace(std::move(image));
                         parked.tokens = on_disk.tokens;
                         parked.live = on_disk.live;
+                    } else if (kept && !on_disk.queued) {
+                        // xrig fix #4: the RAM fell short between the probe and the read: stream its K/V into the
+                        // GPUs instead (block 3 below), as when the probe refuses - nothing was restored, so the RAM
+                        // match is left alone just as then (and re-found below if an eviction moved it)
+                        std::fprintf(stderr, "strata serve: conversation disk: %lld tokens: no room in RAM for the "
+                                             "whole image (%s); streaming it instead\n", (long long) on_disk.tokens,
+                                     disk_err.c_str());
+                        stream = on_disk;
                     } else {
                         std::fprintf(stderr, "strata serve: conversation disk: %lld tokens not restored (%s); reading "
                                              "the prompt\n", (long long) on_disk.tokens, disk_err.c_str());
                     }
-                    if (evicted && !incoming) parked = conversations.best(ids, req_imgs, want_cvec);   // indices moved
+                    if (!incoming && conversations.evictions() != evictions_before)
+                        parked = conversations.best(ids, req_imgs, want_cvec);   // indices moved (either block's evictions)
                 }
             }
             if (!incoming && stream.id == 0 && parked.tokens > std::max(resume, slot_tokens))
@@ -13338,6 +13356,10 @@ int main(int argc, char** argv) {
                 helper_bytes_before = bytes;
             }
         }
+        // TODO(xrig, office review of #1937): a pending #879 flush (nan_flush set by a non-finite logit, applied only at
+        // the next request) is not honoured here, so a QUIT before that request saves the poisoned live session and
+        // the parked conversations for the next start.  Moot with --conversation-disk-persist off (our setting): check
+        // nan_flush here (clear instead of saving) before enabling `on` or `exit-only`.
         if (conv_disk.persistent()) {
             // --conversation-disk-persist: the current conversation and every parked one to the disk for the next start
             const auto t0 = Clock::now();

@@ -98,16 +98,18 @@ public:
         return best;
     }
 
-    /// Hands entry `id` back in `out` (its stage images included) and removes it from the tier either way: from RAM
-    /// when it is still queued, else from the disk (waiting for its write when it is being written).  `admit(need,
-    /// why)` is asked before each file's payload is allocated (session_file_read's RAM preflight).  `tokens` is what
-    /// the request reuses (diagnostics).  On failure `out` is empty and `error` says why.
+    /// Hands entry `id` back in `out` (its stage images included) and removes it from the tier: from RAM when it is
+    /// still queued, else from the disk (waiting for its write when it is being written).  `admit(need, why)` is
+    /// asked before each file's payload is allocated (session_file_read's RAM preflight).  `tokens` is what the
+    /// request reuses (diagnostics).  On failure `out` is empty and `error` says why.
     /// With `kv` (per image, its K/V targets: conversation_snapshot_targets) the files' K/V is streamed into them
     /// instead of RAM, and `out` gets the rest; a queued entry is refused (its image is in RAM: take it without).
     /// On failure after a read began, the targets may hold part of it.
+    /// xrig fix #4: a read that fails only for want of RAM (SessionError::memory) keeps the entry and its files (put
+    /// back as the newest) and sets `*kept`; any other failure (damaged, another conversation, I/O) removes them.
     bool take(uint64_t id, int64_t tokens, SavedConversation& out, std::string& error,
               const std::function<bool(uint64_t need_bytes, std::string& why)>& admit = {},
-              const std::vector<std::vector<SessionKvTarget>>* kv = nullptr);
+              const std::vector<std::vector<SessionKvTarget>>* kv = nullptr, bool* kept = nullptr);
 
     /// Whether images wait in the queue or are being written (their RAM is not back yet).
     bool pending() const;
@@ -140,6 +142,7 @@ private:
         SavedConversation image;
     };
     void writer();
+    bool put_body(SavedConversation&& image);                // put() without its exception guard (xrig fix #3)
     using WriteFile = std::function<bool(size_t image, const std::string& path, size_t& written, std::string& error)>;
     void write(Job& job);                                    // without the lock
     bool store(Entry e, size_t images, const WriteFile& write_file, const char* how);   // writes e's files, keeps e
@@ -161,6 +164,7 @@ private:
     bool writing_ = false;        ///< the writer holds a job (writing_entry_ is its keys)
     Entry writing_entry_;
     bool stop_ = false;
+    uint64_t clears_ = 0;         ///< clear() calls (xrig fix #4: a read clear() overlapped does not put its entry back)
     std::thread thread_;
     ConversationDiskStats stats_;
 };
