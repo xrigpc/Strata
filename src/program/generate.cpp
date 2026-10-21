@@ -8243,6 +8243,24 @@ int main(int argc, char** argv) {
         disk_opts.dir = conversations.enabled() ? o.conversation_disk_dir : std::string();
         disk_opts.budget_bytes = (uint64_t) o.conversation_disk_mib << 20;
         disk_opts.min_free_bytes = (uint64_t) o.session_min_free_mib << 20;
+        // xrig tier fix: the write gate and the park's wait bound.  Environment, not flags, so a launcher sets them
+        // without a new command line: STRATA_CONV_DISK_MIN_TOKENS (default 16384; 0 writes every eviction),
+        // STRATA_CONV_DISK_DAY_MIB (default 0: no daily limit), STRATA_CONV_DISK_WAIT_MS (default 2000; -1 waits as
+        // long as the writes take, the old behaviour).
+        auto env_i64 = [](const char* name, int64_t fallback) -> int64_t {
+            const char* v = std::getenv(name);
+            if (!v || !*v) return fallback;
+            char* end = nullptr;
+            const long long x = std::strtoll(v, &end, 10);
+            return (end && *end == '\0') ? (int64_t) x : fallback;
+        };
+        disk_opts.min_write_tokens = (uint64_t) std::max<int64_t>(0, env_i64("STRATA_CONV_DISK_MIN_TOKENS", 16384));
+        disk_opts.day_write_bytes = (uint64_t) std::max<int64_t>(0, env_i64("STRATA_CONV_DISK_DAY_MIB", 0)) << 20;
+        const uint64_t disk_opts_min_tokens = disk_opts.min_write_tokens, disk_opts_day_mib = disk_opts.day_write_bytes >> 20;
+        const int64_t disk_wait_ms = env_i64("STRATA_CONV_DISK_WAIT_MS", 2000);
+        // review (lane): a restore that gives up falls back to reading the whole prompt again (~75 s at 100K+ vs a
+        // disk restore's 8-12 s), so restores wait longer than parks; both beat, which is what the watchdog needs
+        const int64_t disk_restore_wait_ms = env_i64("STRATA_CONV_DISK_RESTORE_WAIT_MS", 30000);
         if (o.conversation_disk_persist != "off" && !disk_opts.dir.empty()) {
             // the session files' identity: a later start with the same model and settings takes the files in
             std::string id_err;
@@ -8259,6 +8277,10 @@ int main(int argc, char** argv) {
                                  "(--conversation-cache-mib, --conversation-cache-slots, --prompt-cache): off\n");
         if (std::string disk_err; !conv_disk.open(disk_err))
             std::fprintf(stderr, "strata serve: conversation disk tier off: %s\n", disk_err.c_str());
+        else if (conv_disk.enabled())
+            std::fprintf(stderr, "strata serve: conversation disk: write gate min_tokens=%llu day_mib=%llu park_wait_ms=%lld restore_wait_ms=%lld\n",
+                         (unsigned long long) disk_opts_min_tokens, (unsigned long long) disk_opts_day_mib,
+                         (long long) disk_wait_ms, (long long) disk_restore_wait_ms);
         bool disk_writes = conv_disk.enabled() && o.conversation_disk_persist != "exit-only";   // none until QUIT
         if (conv_disk.enabled())
             conversations.set_on_evict([&conv_disk, &disk_writes](strata::core::SavedConversation&& image) {
@@ -8273,8 +8295,9 @@ int main(int argc, char** argv) {
         // Room in RAM for `need` more bytes above `floor`: malloc's freed heap first, then the disk tier's queued
         // writes (their RAM comes back), then the RAM cache's oldest conversations.  `mem` keeps the last reading
         // for the caller's message.
+        bool disk_busy = false;   // xrig tier fix: make_ram gave up on the disk's queued writes (bounded wait)
         auto make_ram = [&](uint64_t need, uint64_t floor, size_t& evicted,
-                            std::optional<strata::core::HostMemoryReading>& mem) -> bool {
+                            std::optional<strata::core::HostMemoryReading>& mem, int64_t wait_ms) -> bool {
             bool trimmed = false;
             for (;;) {
                 mem = strata::core::sample_host_memory();
@@ -8282,7 +8305,17 @@ int main(int argc, char** argv) {
                                                             need, floor))
                     return true;
                 if (!trimmed) { return_freed_heap(); trimmed = true; continue; }
-                if (conv_disk.pending()) { conv_disk.wait_idle(); trimmed = false; continue; }
+                if (conv_disk.pending()) {
+                    // xrig tier fix: a bounded wait that beats.  A slow disk used to hold the request here for as
+                    // long as its queued writes took (60 s stalls and a watchdog restart on a DRAM-less drive); past
+                    // the bound the park is skipped instead (a cache miss, not an outage).
+                    if (!conv_disk.wait_idle_for(wait_ms, [] { strata::core::progress_beat(); })) {
+                        disk_busy = true;
+                        return false;
+                    }
+                    trimmed = false;
+                    continue;
+                }
                 if (conversations.size() == 0 || evicted >= conversations.slots() || !conversations.evict_oldest())
                     return false;
                 ++evicted;
@@ -8441,8 +8474,15 @@ int main(int argc, char** argv) {
                 // (MemAvailable, the cgroup limits above the engine, --memory-limit-mib).
                 size_t evicted = 0;
                 std::optional<strata::core::HostMemoryReading> mem;
-                if (!make_ram(additional, floor, evicted, mem)) {
-                    if (disk_writes && park_streamed()) return true;
+                disk_busy = false;
+                if (!make_ram(additional, floor, evicted, mem, disk_wait_ms)) {
+                    // xrig tier fix: a disk still busy past the bound takes no streamed park either
+                    if (disk_writes && !disk_busy && park_streamed()) return true;
+                    if (disk_busy)   // review (lane): say why - the disk's queued writes, not the RAM reading
+                        std::fprintf(stderr, "strata serve: conversation cache: skip parking (disk busy: its queued writes did not end within %lld ms; need %zu MiB plus %lld MiB floor, %s; %zu still parked)\n",
+                                     (long long) disk_wait_ms, additional >> 20, (long long) o.conversation_cache_min_free_mib,
+                                     ram_note(mem).c_str(), conversations.size());
+                    else
                     std::fprintf(stderr, "strata serve: conversation cache: skip parking (physical RAM admission; need %zu MiB plus %lld MiB floor, %s; evicted %zu, %zu still parked)\n",
                                  additional >> 20, (long long) o.conversation_cache_min_free_mib, ram_note(mem).c_str(),
                                  evicted, conversations.size());
@@ -11110,7 +11150,8 @@ int main(int argc, char** argv) {
                     // asks), not the bare file bytes - a borderline image passed the probe, then failed the read's
                     // admission and was lost instead of streamed.
                     if (!on_disk.queued &&
-                        !make_ram(strata::core::session_read_peak_bytes(on_disk.bytes), floor, evicted, room))
+                        !make_ram(strata::core::session_read_peak_bytes(on_disk.bytes), floor, evicted, room,
+                                  disk_restore_wait_ms))
                         stream = on_disk;
                 }
                 if (stream.id == 0 && on_disk.tokens > std::max({resume, slot_tokens, parked.tokens})) {
@@ -11118,7 +11159,7 @@ int main(int argc, char** argv) {
                     size_t evicted = 0;
                     auto admit = [&](uint64_t need, std::string& why) -> bool {
                         std::optional<strata::core::HostMemoryReading> mem;
-                        if (make_ram(need, floor, evicted, mem)) return true;
+                        if (make_ram(need, floor, evicted, mem, disk_restore_wait_ms)) return true;
                         why = "not enough RAM: " + ram_note(mem);
                         return false;
                     };
@@ -11253,7 +11294,7 @@ int main(int argc, char** argv) {
                 size_t evicted = 0;
                 auto admit = [&](uint64_t need, std::string& why) -> bool {
                     std::optional<strata::core::HostMemoryReading> mem;
-                    if (make_ram(need, floor, evicted, mem)) return true;
+                    if (make_ram(need, floor, evicted, mem, disk_restore_wait_ms)) return true;
                     why = "not enough RAM even for the running state: " + ram_note(mem);
                     return false;
                 };

@@ -584,6 +584,65 @@ int main() {
         }
     }
 
+    {   // xrig tier fix: wait_idle_for gives up after its bound and beats meanwhile; the write still ends later
+        std::promise<void> release;
+        std::shared_future<void> gate = release.get_future().share();
+        auto o = opts(dir, GiB);
+        o.before_write = [gate] { gate.wait(); };
+        ConversationDiskTier tier(std::move(o));
+        check(tier.open(e) && tier.put(image(400, 50)), "bounded wait: a write held");
+        int beats = 0;
+        const bool idle = tier.wait_idle_for(600, [&beats] { ++beats; });
+        check(!idle && beats >= 2 && tier.pending(), "bounded wait: gives up after the bound, beating meanwhile");
+        check(tier.stats().wait_timeouts == 1 && logged("gave up waiting"), "bounded wait: counted and logged");
+        release.set_value();
+        check(tier.wait_idle_for(-1, nullptr) && !tier.pending() && tier.size() == 1,
+              "bounded wait: no limit (-1) waits like wait_idle; the held write ended");
+        check(tier.wait_idle_for(10, nullptr), "bounded wait: an idle tier returns at once");
+        tier.clear();
+    }
+
+    {   // xrig tier fix: the write gate - short conversations are not written
+        auto o = opts(dir, GiB);
+        o.min_write_tokens = 500;
+        ConversationDiskTier tier(std::move(o));
+        check(tier.open(e) && !tier.put(image(400, 51)), "min tokens: a 400-token conversation is not written");
+        check(tier.put(image(600, 52, 9000)), "min tokens: a 600-token one is");
+        tier.wait_idle();
+        check(tier.size() == 1 && tier.stats().skipped_short == 1 && logged("under the minimum tokens"),
+              "min tokens: counted and logged");
+        tier.clear();
+    }
+
+    {   // xrig tier fix: the same state already on the disk (live or a checkpoint) is not written again; a longer
+        // entry alone does not count (conversation_prefix needs the stored tokens to be a prefix of the prompt)
+        ConversationDiskTier tier(opts(dir, GiB));
+        check(tier.open(e) && tier.put(image(400, 53)), "same state: the first copy is written");
+        tier.wait_idle();
+        check(!tier.put(image(400, 54)) && tier.stats().skipped_covered == 1 && logged("the disk already holds it"),
+              "same state: the same 400 tokens again are not written");
+        check(!tier.put(image(200, 55)), "same state: a state equal to the entry's checkpoint is not written");
+        check(tier.put(image(300, 56)), "same state: a shorter state that is no checkpoint of it IS written");
+        check(tier.put(image(800, 57)), "same state: a longer one is written");
+        tier.wait_idle();
+        check(tier.size() == 3, "same state: three entries on the disk");
+        tier.clear();
+    }
+
+    {   // xrig tier fix: the daily write budget
+        const uint64_t one = image(400, 58).bytes();
+        auto o = opts(dir, GiB);
+        o.day_write_bytes = one * 2 + one / 2;   // room for two
+        ConversationDiskTier tier(std::move(o));
+        check(tier.open(e) && tier.put(image(400, 58, 1000)) && tier.put(image(400, 59, 3000)),
+              "day budget: two writes fit");
+        check(!tier.put(image(400, 60, 5000)) && tier.stats().skipped_day == 1 && logged("over the daily write budget"),
+              "day budget: the third is not written, counted and logged");
+        tier.wait_idle();
+        check(tier.size() == 2, "day budget: two entries on the disk");
+        tier.clear();
+    }
+
     fs::remove_all(dir);
     std::printf("conversation_disk_test: %d checks passed\n", checks);
     return 0;

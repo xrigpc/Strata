@@ -12,12 +12,14 @@
 #include <condition_variable>
 #include <cstddef>
 #include <cstdint>
+#include <chrono>
 #include <deque>
 #include <functional>
 #include <mutex>
 #include <string>
 #include <system_error>
 #include <thread>
+#include <utility>
 #include <vector>
 
 namespace strata::core {
@@ -27,6 +29,12 @@ struct ConversationDiskOptions {
     uint64_t budget_bytes = 0;       ///< at most this many bytes of files; 0: off
     uint64_t min_free_bytes = 0;     ///< a write needs the file plus this much free on the disk (session preflight)
     bool persist = false;            ///< keep the files for later runs, bound to `identity`
+    /// xrig tier fix: write only conversations of at least this many tokens (0: all).  A short one costs a few seconds
+    /// to read again, so the tier gains little and the disk pays the write.
+    uint64_t min_write_tokens = 0;
+    /// xrig tier fix: at most this many bytes queued for writing per rolling 24 h (0: no limit).  Past it, evicted
+    /// conversations are dropped instead of written, so a busy or periodic client cannot wear the disk out.
+    uint64_t day_write_bytes = 0;
     SessionFileIdentity identity;    ///< persist: the session files' identity (model and settings fingerprints)
     /// Called with every diagnostic line (no trailing newline), from the caller's or the writer's thread.
     std::function<void(const std::string&)> log;
@@ -38,6 +46,7 @@ struct ConversationDiskOptions {
 struct ConversationDiskStats {
     size_t queued = 0, written = 0, write_failed = 0, ram_hits = 0, disk_hits = 0, read_failed = 0;
     size_t evicted = 0, waits = 0;
+    size_t skipped_short = 0, skipped_covered = 0, skipped_day = 0, wait_timeouts = 0;   ///< xrig tier fix
     uint64_t bytes_written = 0, bytes_read = 0;
     uint64_t tokens_back = 0;                 ///< prompt tokens given back (not read again) by ram or disk hits
     double write_ms = 0, read_ms = 0, wait_ms = 0;
@@ -115,6 +124,9 @@ public:
     bool pending() const;
     /// Blocks until the queue is empty and no write runs.
     void wait_idle();
+    /// xrig tier fix: like wait_idle() but gives up after `max_ms` (negative: no limit), calling `beat` about every
+    /// 250 ms while it waits so a watchdog sees a wait that moves.  True when the tier went idle.
+    bool wait_idle_for(int64_t max_ms, const std::function<void()>& beat);
     /// #879: every conversation goes - queued, being written (waited for) and on the disk, files too.  Returns how many.
     size_t clear();
 
@@ -167,6 +179,11 @@ private:
     uint64_t clears_ = 0;         ///< clear() calls (xrig fix #4: a read clear() overlapped does not put its entry back)
     std::thread thread_;
     ConversationDiskStats stats_;
+    /// xrig tier fix: the write gate (call with m_ held).  Null when the conversation may be queued (it is then
+    /// counted against the daily budget), else why it is not written.
+    const char* write_gate(const ConversationCheckpoint& live, bool cvec, uint64_t bytes);
+    std::deque<std::pair<std::chrono::steady_clock::time_point, uint64_t>> day_writes_;   ///< queued bytes, last 24 h
+    uint64_t day_bytes_ = 0;
 };
 
 }  // namespace strata::core
