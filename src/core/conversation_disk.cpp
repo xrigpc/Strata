@@ -6,6 +6,7 @@
 #include <cstdarg>
 #include <cstdio>
 #include <cstring>
+#include <ctime>
 #include <exception>
 #include <filesystem>
 #include <fstream>
@@ -447,9 +448,11 @@ bool ConversationDiskTier::put_body(SavedConversation&& image) {
     uint64_t queued_bytes = 0;
     const uint64_t estimate = job.entry.bytes;
     const char* why = nullptr;   // xrig tier fix: the write gate's refusal, if any
+    std::string note;
+    bool quiet = false;
     {
         std::lock_guard<std::mutex> lock(m_);
-        why = write_gate(job.entry.live, job.entry.cvec, estimate);
+        why = write_gate(job.entry.live, job.entry.cvec, estimate, note, quiet);
         if (!why) {
             job.entry.id = ++next_id_;
             queue_.push_back(std::move(job));
@@ -458,8 +461,9 @@ bool ConversationDiskTier::put_body(SavedConversation&& image) {
             for (const auto& j : queue_) queued_bytes += j.entry.bytes;
         }
     }
+    if (!note.empty()) try { log(note); } catch (...) {}
     if (why) {   // not written: the caller drops it, as for a refused write (write_gate counted it)
-        try { log(fmt("not written: %zu tokens, %.0f MiB (%s)", tokens, mib(estimate), why)); } catch (...) {}
+        if (!quiet) try { log(fmt("not written: %zu tokens, %.0f MiB (%s)", tokens, mib(estimate), why)); } catch (...) {}
         return false;
     }
     cv_.notify_all();
@@ -554,12 +558,16 @@ bool ConversationDiskTier::put_streamed(SavedConversation& meta,
     }
     {
         std::unique_lock<std::mutex> lock(m_);
-        if (const char* why = write_gate(e.live, e.cvec, e.bytes)) {
-            lock.unlock();
-            log(fmt("not written: %zu tokens, %.0f MiB, streamed (%s)", e.live.ids.size(), mib(e.bytes), why));
+        std::string note;
+        bool quiet = false;
+        const char* why = write_gate(e.live, e.cvec, e.bytes, note, quiet);
+        if (!why) e.id = ++next_id_;
+        lock.unlock();
+        if (!note.empty()) log(note);
+        if (why) {
+            if (!quiet) log(fmt("not written: %zu tokens, %.0f MiB, streamed (%s)", e.live.ids.size(), mib(e.bytes), why));
             return false;
         }
-        e.id = ++next_id_;
     }
     std::vector<SavedConversation> parts = std::move(meta.stage_images);
     meta.stage_images.clear();
@@ -853,7 +861,22 @@ static bool same_state(const ConversationCheckpoint& a, const ConversationCheckp
     return !a.ids.empty() && a.ids == b.ids && a.imgs == b.imgs;
 }
 
-const char* ConversationDiskTier::write_gate(const ConversationCheckpoint& live, bool cvec, uint64_t bytes) {
+// Local wall-clock HH:MM of a steady_clock time (for a notice a person reads).
+static std::string clock_of(std::chrono::steady_clock::time_point t) {
+    const auto wall = std::chrono::system_clock::now() +
+                      std::chrono::duration_cast<std::chrono::system_clock::duration>(t - std::chrono::steady_clock::now());
+    const std::time_t tt = std::chrono::system_clock::to_time_t(wall);
+    std::tm tm{};
+    char buf[16] = "?";
+    if (localtime_r(&tt, &tm)) std::strftime(buf, sizeof buf, "%H:%M", &tm);
+    return buf;
+}
+
+// One line per this many refusals while the daily budget is full (the first one is always logged).
+static constexpr uint64_t kDayRefusalLogEvery = 100;
+
+const char* ConversationDiskTier::write_gate(const ConversationCheckpoint& live, bool cvec, uint64_t bytes,
+                                             std::string& note, bool& quiet) {
     if (options_.min_write_tokens && live.ids.size() < options_.min_write_tokens) {
         ++stats_.skipped_short;
         return "under the minimum tokens for a write";
@@ -880,7 +903,24 @@ const char* ConversationDiskTier::write_gate(const ConversationCheckpoint& live,
         }
         if (day_bytes_ + bytes > options_.day_write_bytes) {
             ++stats_.skipped_day;
+            if (!day_full_) {   // xrig: say once that the guard engaged, and until when at the earliest
+                day_full_ = true;
+                day_refusals_ = 0;
+                note = fmt("daily write budget reached (%.0f of %.0f MiB written in the last 24 h): conversations "
+                           "stay in RAM only, not written to the disk, until room frees (at the earliest %s, when "
+                           "the oldest write leaves the 24 h window); refusals are logged 1 in %llu",
+                           mib(day_bytes_), mib(options_.day_write_bytes),
+                           day_writes_.empty() ? "now" : clock_of(day_writes_.front().first + std::chrono::hours(24)).c_str(),
+                           (unsigned long long) kDayRefusalLogEvery);
+            }
+            quiet = day_refusals_++ % kDayRefusalLogEvery != 0;
             return "over the daily write budget";
+        }
+        if (day_full_) {
+            day_full_ = false;
+            note = fmt("daily write budget has room again (%.0f of %.0f MiB in the last 24 h): writing to the disk "
+                       "resumes after %llu refused write%s", mib(day_bytes_), mib(options_.day_write_bytes),
+                       (unsigned long long) day_refusals_, day_refusals_ == 1 ? "" : "s");
         }
         day_writes_.emplace_back(now, bytes);
         day_bytes_ += bytes;
