@@ -446,13 +446,21 @@ bool ConversationDiskTier::put_body(SavedConversation&& image) {
     size_t depth = 0;
     uint64_t queued_bytes = 0;
     const uint64_t estimate = job.entry.bytes;
+    const char* why = nullptr;   // xrig tier fix: the write gate's refusal, if any
     {
         std::lock_guard<std::mutex> lock(m_);
-        job.entry.id = ++next_id_;
-        queue_.push_back(std::move(job));
-        ++stats_.queued;   // xrig fix #3: once it is in the queue (a throw above counts as a failed write instead)
-        depth = queue_.size();
-        for (const auto& j : queue_) queued_bytes += j.entry.bytes;
+        why = write_gate(job.entry.live, job.entry.cvec, estimate);
+        if (!why) {
+            job.entry.id = ++next_id_;
+            queue_.push_back(std::move(job));
+            ++stats_.queued;   // xrig fix #3: once it is in the queue (a throw above counts as a failed write instead)
+            depth = queue_.size();
+            for (const auto& j : queue_) queued_bytes += j.entry.bytes;
+        }
+    }
+    if (why) {   // not written: the caller drops it, as for a refused write (write_gate counted it)
+        try { log(fmt("not written: %zu tokens, %.0f MiB (%s)", tokens, mib(estimate), why)); } catch (...) {}
+        return false;
     }
     cv_.notify_all();
     try {   // xrig fix #3: queued: a failure to log is not a failed put
@@ -467,6 +475,13 @@ void ConversationDiskTier::writer() {
 #if defined(__linux__)
     // below the serving threads: the write is background work, decode and prompt reading come first
     setpriority(PRIO_PROCESS, (id_t) syscall(SYS_gettid), 10);
+    // xrig tier fix: the lowest best-effort I/O class too, so the snapshot writes yield the disk to the model's own
+    // reads (--ple-io direct reads the PLE table on the token path).  Best-effort, not idle: idle could starve the
+    // queue, whose images hold RAM until written.  Ignored when the I/O scheduler does not use priorities.
+    {
+        constexpr int ioprio_class_be = 2, ioprio_class_shift = 13, ioprio_who_process = 1;
+        syscall(SYS_ioprio_set, ioprio_who_process, (int) syscall(SYS_gettid), (ioprio_class_be << ioprio_class_shift) | 7);
+    }
 #endif
     for (;;) {
         Job job;
@@ -538,7 +553,12 @@ bool ConversationDiskTier::put_streamed(SavedConversation& meta,
         return false;
     }
     {
-        std::lock_guard<std::mutex> lock(m_);
+        std::unique_lock<std::mutex> lock(m_);
+        if (const char* why = write_gate(e.live, e.cvec, e.bytes)) {
+            lock.unlock();
+            log(fmt("not written: %zu tokens, %.0f MiB, streamed (%s)", e.live.ids.size(), mib(e.bytes), why));
+            return false;
+        }
         e.id = ++next_id_;
     }
     std::vector<SavedConversation> parts = std::move(meta.stage_images);
@@ -796,6 +816,76 @@ void ConversationDiskTier::wait_idle() {
     stats_.wait_ms += ms;
     lock.unlock();
     log(fmt("waited %.0f ms for %zu queued write%s (their RAM was needed)", ms, depth, depth == 1 ? "" : "s"));
+}
+
+bool ConversationDiskTier::wait_idle_for(int64_t max_ms, const std::function<void()>& beat) {
+    if (max_ms < 0) { wait_idle(); return true; }
+    std::unique_lock<std::mutex> lock(m_);
+    if (queue_.empty() && !writing_) return true;
+    const auto t0 = std::chrono::steady_clock::now();
+    const auto deadline = t0 + std::chrono::milliseconds(max_ms);
+    const size_t depth = queue_.size() + (writing_ ? 1 : 0);
+    bool idle = false;
+    for (;;) {
+        const auto now = std::chrono::steady_clock::now();
+        if (now >= deadline) break;
+        const auto slice = std::min<std::chrono::steady_clock::duration>(deadline - now, std::chrono::milliseconds(250));
+        if (cv_.wait_for(lock, slice, [&] { return queue_.empty() && !writing_; })) { idle = true; break; }
+        if (beat) { lock.unlock(); beat(); lock.lock(); }
+    }
+    const double ms = ms_since(t0);
+    ++stats_.waits;
+    stats_.wait_ms += ms;
+    if (!idle) ++stats_.wait_timeouts;
+    lock.unlock();
+    if (beat) beat();
+    log(idle ? fmt("waited %.0f ms for %zu queued write%s (their RAM was needed)", ms, depth, depth == 1 ? "" : "s")
+             : fmt("gave up waiting after %.0f ms for %zu queued write%s (bound %lld ms): the park is skipped", ms, depth,
+                   depth == 1 ? "" : "s", (long long) max_ms));
+    return idle;
+}
+
+// The disk (or the queue) already holds exactly the state `want`, as an entry's live state or as one of its
+// checkpoints: the same tokens and images and control-vector state.  Then writing `want` adds nothing, because every
+// prompt it could serve (conversation_prefix: its tokens are a prefix of the prompt) that state serves as well.  A
+// LONGER entry is not enough: a prompt that leaves it after `want`'s end does not match its live state.
+static bool same_state(const ConversationCheckpoint& a, const ConversationCheckpoint& b) {
+    return !a.ids.empty() && a.ids == b.ids && a.imgs == b.imgs;
+}
+
+const char* ConversationDiskTier::write_gate(const ConversationCheckpoint& live, bool cvec, uint64_t bytes) {
+    if (options_.min_write_tokens && live.ids.size() < options_.min_write_tokens) {
+        ++stats_.skipped_short;
+        return "under the minimum tokens for a write";
+    }
+    auto has_state = [&](const Entry& e) {
+        if (e.cvec != cvec) return false;
+        if (same_state(e.live, live)) return true;
+        for (const auto& c : e.checkpoints)
+            if (same_state(c, live)) return true;
+        return false;
+    };
+    bool covered = writing_ && has_state(writing_entry_);
+    for (const auto& e : entries_) covered = covered || has_state(e);
+    for (const auto& j : queue_) covered = covered || has_state(j.entry);
+    if (covered) {
+        ++stats_.skipped_covered;
+        return "the disk already holds it";
+    }
+    if (options_.day_write_bytes) {
+        const auto now = std::chrono::steady_clock::now();
+        while (!day_writes_.empty() && now - day_writes_.front().first > std::chrono::hours(24)) {
+            day_bytes_ -= day_writes_.front().second;
+            day_writes_.pop_front();
+        }
+        if (day_bytes_ + bytes > options_.day_write_bytes) {
+            ++stats_.skipped_day;
+            return "over the daily write budget";
+        }
+        day_writes_.emplace_back(now, bytes);
+        day_bytes_ += bytes;
+    }
+    return nullptr;
 }
 
 size_t ConversationDiskTier::size() const {
