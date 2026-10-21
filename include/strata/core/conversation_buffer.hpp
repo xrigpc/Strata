@@ -7,8 +7,11 @@
 #include <cstdint>
 #include <cstring>
 #include <initializer_list>
+#include <cstdlib>
 #include <memory>
+#include <mutex>
 #include <new>
+#include <string>
 #include <utility>
 #include <vector>
 
@@ -17,6 +20,62 @@
 #endif
 
 namespace strata::core {
+
+// xrig fix (21-Oct): a small pool of full 16 MiB segment mappings that were freed, reused by the next capture.  A
+// fresh mapping costs a page fault per 4 KiB when a park first writes it, on the request path (measured ~+0.8 s TTFT
+// per turn on DDR4); transparent huge pages avoid the faults but stall in direct compaction on a box whose free RAM
+// is fragmented by the pinned expert copy (pc-4: +30% session time).  A pooled mapping is already faulted in.  Up
+// to STRATA_CONV_SEGMENT_POOL_MIB (default 2048; 0 turns the pool off) stays mapped; beyond it, and whenever the
+// caller needs RAM back (release_segment_pool, from the same place that trims malloc's heap), mappings are unmapped
+// as before, so the freed memory still goes back to the kernel.
+namespace conversation_detail {
+inline constexpr size_t pooled_segment_bytes = 16 * 1024 * 1024;
+struct SegmentPool {
+    std::mutex m;
+    std::vector<void*> free;
+    size_t hits = 0, misses = 0, unmapped_over_cap = 0, released = 0;   // counts for the park log line
+    static SegmentPool& get() { static SegmentPool* pool = new SegmentPool; return *pool; }   // leaked: usable at exit
+    static size_t cap() {
+        static const size_t c = [] {
+            const char* v = std::getenv("STRATA_CONV_SEGMENT_POOL_MIB");
+            const long long mib = (v && *v) ? std::atoll(v) : 2048;
+            return mib > 0 ? (size_t) mib / 16 : size_t(0);   // in segments
+        }();
+        return c;
+    }
+};
+}  // namespace conversation_detail
+
+// Unmaps pooled segment mappings until at least `bytes` went back to the kernel (all of them by default), so a
+// caller short of RAM gives back only its shortfall and the rest of the pool keeps serving captures.  Returns the
+// bytes released.
+inline size_t release_segment_pool(size_t bytes = SIZE_MAX) {
+#if defined(__linux__)
+    auto& pool = conversation_detail::SegmentPool::get();
+    std::vector<void*> take;
+    {
+        std::lock_guard<std::mutex> lock(pool.m);
+        const size_t seg = conversation_detail::pooled_segment_bytes;
+        const size_t n = bytes == SIZE_MAX ? pool.free.size() : std::min(pool.free.size(), (bytes + seg - 1) / seg);
+        take.assign(pool.free.end() - (ptrdiff_t) n, pool.free.end());
+        pool.free.resize(pool.free.size() - n);
+        pool.released += n;
+    }
+    for (void* p : take) ::munmap(p, conversation_detail::pooled_segment_bytes);
+    return take.size() * conversation_detail::pooled_segment_bytes;
+#else
+    return 0;
+#endif
+}
+
+// "pool held/hits/misses/over_cap/released" for a log line (segments, since start).
+inline std::string segment_pool_note() {
+    auto& pool = conversation_detail::SegmentPool::get();
+    std::lock_guard<std::mutex> lock(pool.m);
+    return "segment_pool held=" + std::to_string(pool.free.size()) + " hits=" + std::to_string(pool.hits) +
+           " misses=" + std::to_string(pool.misses) + " over_cap=" + std::to_string(pool.unmapped_over_cap) +
+           " released=" + std::to_string(pool.released);
+}
 
 // xrig fix (20-Oct): on Linux a segment of 1 MiB or more is its own anonymous mapping, unmapped when freed.
 // From malloc's heap a freed segment never went back to the kernel: HIP locks pageable copies through KFD SVM
@@ -31,6 +90,12 @@ template<class T> struct SegmentAllocator {
     T* allocate(size_t n) {
 #if defined(__linux__)
         if (n * sizeof(T) >= map_min) {
+            if (n * sizeof(T) == conversation_detail::pooled_segment_bytes) {   // xrig fix (21-Oct): reuse a pooled one
+                auto& pool = conversation_detail::SegmentPool::get();
+                std::lock_guard<std::mutex> lock(pool.m);
+                if (!pool.free.empty()) { void* q = pool.free.back(); pool.free.pop_back(); ++pool.hits; return static_cast<T*>(q); }
+                ++pool.misses;
+            }
             void* p = ::mmap(nullptr, n * sizeof(T), PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
             if (p == MAP_FAILED) throw std::bad_alloc();
             return static_cast<T*>(p);
@@ -40,6 +105,12 @@ template<class T> struct SegmentAllocator {
     }
     void deallocate(T* p, size_t n) noexcept {
 #if defined(__linux__)
+        if (n * sizeof(T) == conversation_detail::pooled_segment_bytes) {   // xrig fix (21-Oct): keep it for reuse
+            auto& pool = conversation_detail::SegmentPool::get();
+            std::lock_guard<std::mutex> lock(pool.m);
+            if (pool.free.size() < conversation_detail::SegmentPool::cap()) { pool.free.push_back(p); return; }
+            ++pool.unmapped_over_cap;
+        }
         if (n * sizeof(T) >= map_min) { ::munmap(p, n * sizeof(T)); return; }
 #endif
         std::allocator<T>().deallocate(p, n);
