@@ -180,10 +180,14 @@ private:
     std::thread thread_;
     ConversationDiskStats stats_;
     /// xrig tier fix: the write gate (call with m_ held).  Null when the conversation may be queued (it is then
-    /// counted against the daily budget), else why it is not written.
-    const char* write_gate(const ConversationCheckpoint& live, bool cvec, uint64_t bytes);
+    /// counted against the daily budget), else why it is not written.  `note` gets a one-time notice to log after
+    /// unlocking (the daily budget reached, or room again); `quiet` is set for a refusal not worth its own line.
+    const char* write_gate(const ConversationCheckpoint& live, bool cvec, uint64_t bytes, std::string& note,
+                           bool& quiet);
     std::deque<std::pair<std::chrono::steady_clock::time_point, uint64_t>> day_writes_;   ///< queued bytes, last 24 h
     uint64_t day_bytes_ = 0;
+    bool day_full_ = false;        ///< the daily budget refused a write and none has fitted since
+    uint64_t day_refusals_ = 0;    ///< refusals since day_full_ was set
 };
 
 }  // namespace strata::core

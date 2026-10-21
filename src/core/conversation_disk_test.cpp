@@ -138,6 +138,12 @@ bool logged(const char* what) {
     for (const auto& l : lines) if (l.find(what) != std::string::npos) return true;
     return false;
 }
+size_t count_logged(const char* what) {
+    std::lock_guard<std::mutex> g(lines_m);
+    size_t n = 0;
+    for (const auto& l : lines) n += l.find(what) != std::string::npos;
+    return n;
+}
 }  // namespace
 
 int main() {
@@ -630,9 +636,10 @@ int main() {
     }
 
     {   // xrig tier fix: the daily write budget
-        const uint64_t one = image(400, 58).bytes();
+        const uint64_t one = image(400, 58).bytes(), small = image(100, 250, 9000).bytes();
+        check(small < one, "day budget: a 100-token image is smaller than a 400-token one");
         auto o = opts(dir, GiB);
-        o.day_write_bytes = one * 2 + one / 2;   // room for two
+        o.day_write_bytes = one * 2 + small;   // room for two, and then only for the small one
         ConversationDiskTier tier(std::move(o));
         check(tier.open(e) && tier.put(image(400, 58, 1000)) && tier.put(image(400, 59, 3000)),
               "day budget: two writes fit");
@@ -640,6 +647,17 @@ int main() {
               "day budget: the third is not written, counted and logged");
         tier.wait_idle();
         check(tier.size() == 2, "day budget: two entries on the disk");
+        check(count_logged("daily write budget reached") == 1 && logged("at the earliest "),
+              "day budget: one notice that the budget is reached, with the earliest time");
+        const size_t refused_lines = count_logged("over the daily write budget");
+        for (int i = 0; i < 150; ++i) tier.put(image(400, uint8_t(61 + i), 7000 + 2 * i));
+        check(tier.stats().skipped_day == 151 && count_logged("over the daily write budget") == refused_lines + 1 &&
+                  count_logged("daily write budget reached") == 1,
+              "day budget: 150 more refusals log one line (1 in 100) and no second notice");
+        check(tier.put(image(100, 250, 9000)) && logged("daily write budget has room again") &&
+                  logged("resumes after 151 refused writes"),
+              "day budget: a write that fits again is written, with a notice");
+        tier.wait_idle();
         tier.clear();
     }
 
