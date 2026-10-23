@@ -38,6 +38,11 @@ struct ConversationDiskOptions {
     SessionFileIdentity identity;    ///< persist: the session files' identity (model and settings fingerprints)
     /// Called with every diagnostic line (no trailing newline), from the caller's or the writer's thread.
     std::function<void(const std::string&)> log;
+    /// xrig tier fix (A1): take() waits at most this long for its entry's write to end (negative: no limit), calling
+    /// `wait_beat` about every 250 ms meanwhile so a watchdog sees a wait that moves.  Past the bound the take fails
+    /// ("still being written"), the entry is left to its write, and the caller reads the prompt instead.
+    int64_t take_wait_ms = -1;
+    std::function<void()> wait_beat;
     /// Tests: called on the writer thread before each write starts.
     std::function<void()> before_write;
 };
@@ -47,6 +52,7 @@ struct ConversationDiskStats {
     size_t queued = 0, written = 0, write_failed = 0, ram_hits = 0, disk_hits = 0, read_failed = 0;
     size_t evicted = 0, waits = 0;
     size_t skipped_short = 0, skipped_covered = 0, skipped_day = 0, wait_timeouts = 0;   ///< xrig tier fix
+    size_t take_timeouts = 0;   ///< xrig tier fix (A1): takes that gave up on an entry still being written
     uint64_t bytes_written = 0, bytes_read = 0;
     uint64_t tokens_back = 0;                 ///< prompt tokens given back (not read again) by ram or disk hits
     double write_ms = 0, read_ms = 0, wait_ms = 0;

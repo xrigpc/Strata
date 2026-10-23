@@ -8261,6 +8261,9 @@ int main(int argc, char** argv) {
         // review (lane): a restore that gives up falls back to reading the whole prompt again (~75 s at 100K+ vs a
         // disk restore's 8-12 s), so restores wait longer than parks; both beat, which is what the watchdog needs
         const int64_t disk_restore_wait_ms = env_i64("STRATA_CONV_DISK_RESTORE_WAIT_MS", 30000);
+        // xrig tier fix (A1): a restore of an entry still being written waits the same bound, beating
+        disk_opts.take_wait_ms = disk_restore_wait_ms;
+        disk_opts.wait_beat = [] { strata::core::progress_beat(); };
         if (o.conversation_disk_persist != "off" && !disk_opts.dir.empty()) {
             // the session files' identity: a later start with the same model and settings takes the files in
             std::string id_err;

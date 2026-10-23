@@ -705,7 +705,35 @@ bool ConversationDiskTier::take(uint64_t id, int64_t tokens, SavedConversation& 
     double waited = 0;
     if (writing_ && writing_entry_.id == id) {
         const auto w0 = std::chrono::steady_clock::now();
-        cv_.wait(lock, [&] { return !(writing_ && writing_entry_.id == id); });
+        const auto written = [&] { return !(writing_ && writing_entry_.id == id); };
+        const int64_t bound = options_.take_wait_ms;
+        if (bound < 0) {
+            cv_.wait(lock, written);
+        } else {
+            // xrig tier fix (A1): a slow disk held the request here for as long as this entry's write took, with no
+            // beat (a watchdog restart past 60 s).  Bounded, beating; past the bound the prompt is read instead.
+            const auto deadline = w0 + std::chrono::milliseconds(bound);
+            bool done = written();
+            while (!done) {
+                const auto now = std::chrono::steady_clock::now();
+                if (now >= deadline) break;
+                const auto slice =
+                    std::min<std::chrono::steady_clock::duration>(deadline - now, std::chrono::milliseconds(250));
+                if (cv_.wait_for(lock, slice, written)) { done = true; break; }
+                if (options_.wait_beat) { lock.unlock(); options_.wait_beat(); lock.lock(); }
+                done = written();
+            }
+            if (!done) {
+                ++stats_.take_timeouts;
+                const double ms = ms_since(w0);
+                lock.unlock();
+                if (options_.wait_beat) options_.wait_beat();
+                error = fmt("still being written: gave up after %.0f ms (bound %lld ms)", ms, (long long) bound);
+                log(fmt("%lld tokens: gave up waiting after %.0f ms for its write (bound %lld ms): the prompt is read",
+                        (long long) tokens, ms, (long long) bound));
+                return false;   // the entry stays with its write; *kept stays false, so the caller does not stream
+            }
+        }
         waited = ms_since(w0);
     }
     size_t index = entries_.size();

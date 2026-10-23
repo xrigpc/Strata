@@ -3,6 +3,7 @@
 #include "strata/core/conversation_disk.hpp"
 
 #include <algorithm>
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -10,10 +11,12 @@
 #include <fstream>
 #include <future>
 #include <iterator>
+#include <memory>
 #include <mutex>
 #include <new>
 #include <stdexcept>
 #include <string>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -605,6 +608,69 @@ int main() {
         check(tier.wait_idle_for(-1, nullptr) && !tier.pending() && tier.size() == 1,
               "bounded wait: no limit (-1) waits like wait_idle; the held write ended");
         check(tier.wait_idle_for(10, nullptr), "bounded wait: an idle tier returns at once");
+        tier.clear();
+    }
+
+    {   // xrig tier fix (A1): take() of an entry still being written gives up after its bound, beating meanwhile
+        std::promise<void> release, entered;
+        std::shared_future<void> gate = release.get_future().share();
+        auto in_write = std::make_shared<std::promise<void>>(std::move(entered));
+        std::future<void> started = in_write->get_future();
+        int beats = 0;
+        auto o = opts(dir, GiB);
+        o.take_wait_ms = 600;
+        o.wait_beat = [&beats] { ++beats; };
+        o.before_write = [gate, in_write] {
+            try { in_write->set_value(); } catch (...) {}   // only the first write signals
+            gate.wait();
+        };
+        ConversationDiskTier tier(std::move(o));
+        check(tier.open(e) && tier.put(image(400, 70, 7000)), "take bound: a write held");
+        started.wait();   // the writer holds the entry: take() finds it being written, not queued
+        const auto m = tier.best(prompt_of(450, 7000), {}, false);
+        check(m.tokens == 400 && m.id != 0, "take bound: the entry being written still matches");
+        SavedConversation back;
+        bool kept = true;
+        const auto t0 = std::chrono::steady_clock::now();
+        const bool ok = tier.take(m.id, m.tokens, back, e, {}, nullptr, &kept);
+        const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+        check(!ok && !kept && e.find("still being written") != std::string::npos,
+              "take bound: fails as still being written, not kept (the caller reads the prompt, no stream)");
+        check(ms >= 550 && ms < 5000 && beats >= 2, "take bound: gives up after the bound, beating meanwhile");
+        check(tier.stats().take_timeouts == 1 && logged("gave up waiting after") && logged("for its write"),
+              "take bound: counted and logged");
+        release.set_value();
+        check(tier.wait_idle_for(-1, nullptr) && tier.size() == 1, "take bound: the held write still ends, stored");
+        check(tier.take(m.id, m.tokens, back, e) && same(back, image(400, 70, 7000)),
+              "take bound: the entry is intact and taken once written");
+        tier.clear();
+    }
+
+    {   // xrig tier fix (A1): within the bound, take() waits for the write and reads the entry as before
+        std::promise<void> release, entered;
+        std::shared_future<void> gate = release.get_future().share();
+        auto in_write = std::make_shared<std::promise<void>>(std::move(entered));
+        std::future<void> started = in_write->get_future();
+        auto o = opts(dir, GiB);
+        o.take_wait_ms = 30000;
+        o.wait_beat = [] {};
+        o.before_write = [gate, in_write] {
+            try { in_write->set_value(); } catch (...) {}
+            gate.wait();
+        };
+        ConversationDiskTier tier(std::move(o));
+        check(tier.open(e) && tier.put(image(400, 71, 8000)), "take wait: a write held");
+        started.wait();
+        const auto m = tier.best(prompt_of(450, 8000), {}, false);
+        std::thread later([&release] {
+            std::this_thread::sleep_for(std::chrono::milliseconds(300));
+            release.set_value();
+        });
+        SavedConversation back;
+        check(tier.take(m.id, m.tokens, back, e) && same(back, image(400, 71, 8000)) &&
+                  tier.stats().take_timeouts == 0,
+              "take wait: the write ends within the bound and the entry is read");
+        later.join();
         tier.clear();
     }
 
