@@ -7,10 +7,46 @@
 #include <cstdint>
 #include <cstring>
 #include <initializer_list>
+#include <memory>
+#include <new>
 #include <utility>
 #include <vector>
 
+#if defined(__linux__)
+#include <sys/mman.h>
+#endif
+
 namespace strata::core {
+
+// xrig fix (20-Oct): on Linux a segment of 1 MiB or more is its own anonymous mapping, unmapped when freed.
+// From malloc's heap a freed segment never went back to the kernel: HIP locks pageable copies through KFD SVM
+// ranges, and the SVM restore worker faults trimmed (MADV_DONTNEED) heap pages straight back in, so evicting a
+// parked conversation left MemAvailable where it was.  munmap ends the range instead.  Other platforms and small
+// segments keep the ordinary allocator.
+template<class T> struct SegmentAllocator {
+    using value_type = T;
+    static constexpr size_t map_min = 1024 * 1024;
+    SegmentAllocator() = default;
+    template<class U> SegmentAllocator(const SegmentAllocator<U>&) noexcept {}
+    T* allocate(size_t n) {
+#if defined(__linux__)
+        if (n * sizeof(T) >= map_min) {
+            void* p = ::mmap(nullptr, n * sizeof(T), PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+            if (p == MAP_FAILED) throw std::bad_alloc();
+            return static_cast<T*>(p);
+        }
+#endif
+        return std::allocator<T>().allocate(n);
+    }
+    void deallocate(T* p, size_t n) noexcept {
+#if defined(__linux__)
+        if (n * sizeof(T) >= map_min) { ::munmap(p, n * sizeof(T)); return; }
+#endif
+        std::allocator<T>().deallocate(p, n);
+    }
+    template<class U> bool operator==(const SegmentAllocator<U>&) const noexcept { return true; }
+    template<class U> bool operator!=(const SegmentAllocator<U>&) const noexcept { return false; }
+};
 
 // Snapshot-owned host storage. Appending never relocates existing payloads;
 // only the small segment directory can move. No sharing or copy-on-write is
@@ -122,7 +158,7 @@ public:
     }
 
 private:
-    using Segment = std::vector<uint8_t>;
+    using Segment = std::vector<uint8_t, SegmentAllocator<uint8_t>>;
     // A fresh capture allocates exactly its payload. Later appends reserve
     // geometrically growing segments, bounded by 16 MiB. Small chat turns then
     // extend the final allocation instead of adding one transfer per turn.
