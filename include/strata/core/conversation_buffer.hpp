@@ -3,6 +3,7 @@
 #include "strata/core/progress.hpp"
 
 #include <algorithm>
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
@@ -34,6 +35,7 @@ struct SegmentPool {
     std::mutex m;
     std::vector<void*> free;
     size_t hits = 0, misses = 0, unmapped_over_cap = 0, released = 0;   // counts for the park log line
+    std::atomic<size_t> direct_unmapped{0};   // capfix: munmaps of segments the pool does not take (other sizes)
     static SegmentPool& get() { static SegmentPool* pool = new SegmentPool; return *pool; }   // leaked: usable at exit
     static size_t cap() {
         static const size_t c = [] {
@@ -66,6 +68,28 @@ inline size_t release_segment_pool(size_t bytes = SIZE_MAX) {
 #else
     return 0;
 #endif
+}
+
+// capfix (28-Oct): the bytes the pool holds mapped and faulted in, which the next capture takes before it maps
+// anything new: the park pre-check credits them.
+inline size_t segment_pool_held_bytes() {
+    auto& pool = conversation_detail::SegmentPool::get();
+    std::lock_guard<std::mutex> lock(pool.m);
+    return pool.free.size() * conversation_detail::pooled_segment_bytes;
+}
+
+// capfix (28-Oct): every munmap of a segment mapping since start - the pool's releases, the 16 MiB segments freed past
+// its cap, and segments of other sizes freed directly.  ROCr pins pageable memory through KFD userptr ranges for
+// large copies, so an munmap can still start an invalidate/restore: the memfix line prints these after every park
+// and restore, to pair with qcount's userptr restores.
+struct SegmentMunmaps {
+    size_t pool_released = 0, over_cap = 0, direct = 0;
+    size_t total() const { return pool_released + over_cap + direct; }
+};
+inline SegmentMunmaps segment_munmaps() {
+    auto& pool = conversation_detail::SegmentPool::get();
+    std::lock_guard<std::mutex> lock(pool.m);
+    return {pool.released, pool.unmapped_over_cap, pool.direct_unmapped.load(std::memory_order_relaxed)};
 }
 
 // "pool held/hits/misses/over_cap/released" for a log line (segments, since start).
@@ -111,7 +135,12 @@ template<class T> struct SegmentAllocator {
             if (pool.free.size() < conversation_detail::SegmentPool::cap()) { pool.free.push_back(p); return; }
             ++pool.unmapped_over_cap;
         }
-        if (n * sizeof(T) >= map_min) { ::munmap(p, n * sizeof(T)); return; }
+        if (n * sizeof(T) >= map_min) {
+            if (n * sizeof(T) != conversation_detail::pooled_segment_bytes)   // capfix: past the cap is over_cap
+                conversation_detail::SegmentPool::get().direct_unmapped.fetch_add(1, std::memory_order_relaxed);
+            ::munmap(p, n * sizeof(T));
+            return;
+        }
 #endif
         std::allocator<T>().deallocate(p, n);
     }

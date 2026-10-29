@@ -103,9 +103,6 @@
 #include <sys/stat.h>
 #if !defined(__APPLE__)   // major() / minor(): <sys/types.h> on macOS
 #include <sys/sysmacros.h>
-#if defined(__GLIBC__)
-#include <malloc.h>   // malloc_trim
-#endif
 #endif
 #endif
 
@@ -8359,32 +8356,67 @@ int main(int argc, char** argv) {
             conversations.set_on_evict([&conv_disk, &disk_writes](strata::core::SavedConversation&& image) {
                 if (disk_writes) conv_disk.put(std::move(image));   // queued for the writer; a refusal is in its log
             });
-        // freed images stay in malloc's heap, which MemAvailable does not count
-        auto return_freed_heap = [] {
-#if defined(__GLIBC__)
-            malloc_trim(0);
-#endif
+        // capfix (28-Oct): no malloc_trim(0) on the switch path or any other request path.  The trim handed GiBs of
+        // retained heap back on every switch; HIP held those pages in KFD userptr ranges, so the restore worker
+        // pinned them again (a 1.9-3.8 s GPU queue pause per switch, 83/83 on one test box, and the allocation site of its
+        // global OOM), and its passing MemAvailable gain let a capture through that the check after it threw away.
+        // These counters say what the switch path did; a line of them follows every park and every restore.
+        struct MemfixCounters {
+            uint64_t trims = 0;   // malloc_trim calls: none is left; the field shows any build that brings one back
+            uint64_t precheck_skips = 0;      // parks the pre-check refused: no capture taken
+            uint64_t conservative_skips = 0;  // of those, the ones estimate - retained (the old figure) would admit
+            uint64_t postcheck_discards = 0;  // captures the check after them threw away (each one is a finding)
+            uint64_t released_bytes = 0;      // the bytes of those captures, released at once
+            uint64_t parks = 0;               // captures the RAM cache or the disk tier took
+            uint64_t parks_streamed = 0;      // pre-check misses the disk tier took straight from the GPUs
+            uint64_t restores = 0, restore_hits = 0;   // conversations restored / chosen for a request
+            uint64_t guard_trips = 0;         // make_ram loops ended by an eviction that gave no RAM back (patch 01)
+            uint64_t munmaps_seen = 0;        // segment munmaps at the last line (patch 03)
+        } memfix;
+        auto memfix_line = [&memfix](const char* after) {
+            std::fprintf(stderr, "strata serve: memfix: after %s: trims=%llu precheck_skips=%llu conservative_skips=%llu "
+                                 "postcheck_discards=%llu released_mib=%llu parks=%llu parks_streamed=%llu restores=%llu "
+                                 "restore_hits=%llu\n",
+                         after, (unsigned long long) memfix.trims, (unsigned long long) memfix.precheck_skips,
+                         (unsigned long long) memfix.conservative_skips, (unsigned long long) memfix.postcheck_discards,
+                         (unsigned long long) (memfix.released_bytes >> 20), (unsigned long long) memfix.parks,
+                         (unsigned long long) memfix.parks_streamed, (unsigned long long) memfix.restores,
+                         (unsigned long long) memfix.restore_hits);
+            const auto m = strata::core::segment_munmaps();
+            const uint64_t total = (uint64_t) m.total();
+            std::fprintf(stderr, "strata serve: memfix: after %s: segment_munmaps=%llu since_last=%llu (pool_release=%llu "
+                                 "over_cap=%llu direct=%llu)\n",
+                         after, (unsigned long long) total, (unsigned long long) (total - memfix.munmaps_seen),
+                         (unsigned long long) m.pool_released, (unsigned long long) m.over_cap,
+                         (unsigned long long) m.direct);
+            memfix.munmaps_seen = total;
         };
-        // Room in RAM for `need` more bytes above `floor`: malloc's freed heap first, then the disk tier's queued
-        // writes (their RAM comes back), then the RAM cache's oldest conversations.  `mem` keeps the last reading
-        // for the caller's message.
+        // Room in RAM for `need` more bytes above `floor`: the segment pool's shortfall first, then the disk tier's
+        // queued writes (their RAM comes back), then the RAM cache's oldest conversations, whose segments go to the
+        // pool or back to the kernel.  `mem` keeps the last reading for the caller's message.  capfix: no malloc trim
+        // (above); unmapping pooled segments is not one - they are this cache's own unused mappings, and munmap ends
+        // their KFD ranges (counted: segment_munmaps).  `credit_pool` (the park pre-check): the pool's mappings
+        // count as room, since the capture takes them before it maps anything new; releasing them would then gain
+        // nothing (a released segment only moves from the pool to MemAvailable), so the shortfall step is skipped.
         bool disk_busy = false;   // xrig tier fix: make_ram gave up on the disk's queued writes (bounded wait)
         auto make_ram = [&](uint64_t need, uint64_t floor, size_t& evicted,
-                            std::optional<strata::core::HostMemoryReading>& mem, int64_t wait_ms) -> bool {
-            bool trimmed = false;
+                            std::optional<strata::core::HostMemoryReading>& mem, int64_t wait_ms,
+                            bool credit_pool = false) -> bool {
+            bool trimmed = false;   // the pool's shortfall was released after the last change
             for (;;) {
                 mem = strata::core::sample_host_memory();
-                if (strata::core::conversation_memory_admit(mem ? std::optional<uint64_t>(mem->available) : std::nullopt,
+                const uint64_t pooled = credit_pool ? (uint64_t) strata::core::segment_pool_held_bytes() : 0;
+                if (strata::core::conversation_memory_admit(mem ? std::optional<uint64_t>(mem->available + pooled)
+                                                                : std::nullopt,
                                                             need, floor))
                     return true;
                 if (!trimmed) {
-                    // xrig fix (21-Oct): pooled segment mappings first, but only the shortfall, so the rest of the
-                    // pool keeps captures fault-free; then malloc's freed heap
-                    const uint64_t want = need + floor, have = mem ? mem->available : 0;
-                    if (want > have) strata::core::release_segment_pool((size_t) (want - have));
-                    return_freed_heap();
                     trimmed = true;
-                    continue;
+                    // xrig fix (21-Oct): pooled segment mappings first, but only the shortfall, so the rest of the
+                    // pool keeps captures fault-free
+                    const uint64_t want = need + floor, have = mem ? mem->available : 0;
+                    if (!credit_pool && want > have && strata::core::release_segment_pool((size_t) (want - have)) > 0)
+                        continue;
                 }
                 if (conv_disk.pending()) {
                     // xrig tier fix: a bounded wait that beats.  A slow disk used to hold the request here for as
@@ -8562,35 +8594,42 @@ int main(int argc, char** argv) {
                 const uint64_t floor = (uint64_t) o.conversation_cache_min_free_mib * 1024 * 1024;
                 const size_t retained = reuse.bytes() + stage_retained;
                 const size_t additional = estimate > retained ? estimate - retained : 0;
-                // The physical-RAM gate: the incoming snapshot has to fit beside the floor.  make_room()
-                // above only balanced the cache's own budget, so a full cache leaves this one short even
-                // though every parked conversation could give its RAM back - and refusing here throws
-                // away the whole prompt read that produced this snapshot (measured: 270k tokens, 96 s).
-                // Evict the least recently active parked conversations until it fits, or until none are
-                // left.  Each ConversationBuffer is a list of 16 MiB segments, each segment its own
-                // allocation, so an evicted entry is back with the kernel before the next check reads
-                // /proc/meminfo (the disk tier's queued writes are waited for first: make_ram).  slots() bounds the
-                // loop, and the two lines below say what it did either way.  The reading is the guard's
-                // (MemAvailable, the cgroup limits above the engine, --memory-limit-mib).
+                // capfix (2): the physical-RAM gate with no trim before it, on the FULL snapshot estimate above the
+                // floor, not the estimate less the retained K/V (conservative_skips counts the misses the old figure
+                // would admit).  As in the drift arm it evicts the least recently active parked conversations until
+                // the snapshot fits, waiting for the disk tier's queued writes first (make_ram): on this build an
+                // evicted entry's segments go to the pool or back to the kernel, so evicting makes room.  The pool's
+                // mappings are credited (make_ram's credit_pool).  A miss takes no capture; only the disk tier may
+                // still take it straight from the GPUs (parks_streamed).  A capture the check after it throws away
+                // should now be rare: each one is counted, and is a finding.
                 size_t evicted = 0;
                 std::optional<strata::core::HostMemoryReading> mem;
                 disk_busy = false;
-                if (!make_ram(additional, floor, evicted, mem, disk_wait_ms)) {
-                    // xrig tier fix: a disk still busy past the bound takes no streamed park either
-                    if (disk_writes && !disk_busy && park_streamed()) return true;
+                if (!make_ram(estimate, floor, evicted, mem, disk_wait_ms, /*credit_pool=*/true)) {
+                    ++memfix.precheck_skips;
+                    const uint64_t pooled = strata::core::segment_pool_held_bytes();
+                    if (!disk_busy && strata::core::conversation_memory_admit(
+                            mem ? std::optional<uint64_t>(mem->available + pooled) : std::nullopt, additional, floor))
+                        ++memfix.conservative_skips;
                     if (disk_busy)   // review (lane): say why - the disk's queued writes, not the RAM reading
                         std::fprintf(stderr, "strata serve: conversation cache: skip parking (disk busy: its queued writes did not end within %lld ms; need %zu MiB plus %lld MiB floor, %s; %zu still parked)\n",
-                                     (long long) disk_wait_ms, additional >> 20, (long long) o.conversation_cache_min_free_mib,
+                                     (long long) disk_wait_ms, estimate >> 20, (long long) o.conversation_cache_min_free_mib,
                                      ram_note(mem).c_str(), conversations.size());
                     else
-                    std::fprintf(stderr, "strata serve: conversation cache: skip parking (physical RAM admission; need %zu MiB plus %lld MiB floor, %s; evicted %zu, %zu still parked)\n",
-                                 additional >> 20, (long long) o.conversation_cache_min_free_mib, ram_note(mem).c_str(),
-                                 evicted, conversations.size());
+                        std::fprintf(stderr, "strata serve: conversation cache: skip parking (RAM floor, pre-check; need %zu "
+                                             "MiB (the full snapshot; %zu MiB of it retained, %llu MiB pooled credited) plus "
+                                             "%lld MiB floor, %s; evicted %zu, %zu still parked)\n",
+                                     estimate >> 20, retained >> 20, (unsigned long long) (pooled >> 20),
+                                     (long long) o.conversation_cache_min_free_mib, ram_note(mem).c_str(), evicted,
+                                     conversations.size());
+                    // xrig tier fix: a disk still busy past the bound takes no streamed park either
+                    if (disk_writes && !disk_busy && park_streamed()) ++memfix.parks_streamed;
+                    memfix_line("a park");
                     return true;
                 }
                 if (evicted)
                     std::fprintf(stderr, "strata serve: conversation cache: evicted %zu parked conversation%s to admit this snapshot (%zu MiB plus %lld MiB floor)\n",
-                                 evicted, evicted == 1 ? "" : "s", additional >> 20,
+                                 evicted, evicted == 1 ? "" : "s", estimate >> 20,
                                  (long long) o.conversation_cache_min_free_mib);
                 strata::core::SavedConversation image;
                 size_t reused_bytes = 0;
@@ -8610,21 +8649,36 @@ int main(int argc, char** argv) {
                 const auto mem_after = strata::core::sample_host_memory();
                 if (!strata::core::conversation_memory_admit(
                         mem_after ? std::optional<uint64_t>(mem_after->available) : std::nullopt, 0, floor)) {
-                    std::fprintf(stderr, "strata serve: conversation cache: skip parking (RAM floor after capture: %lld MiB needed, %s)\n",
-                                 (long long) o.conversation_cache_min_free_mib, ram_note(mem_after).c_str());
+                    // capfix (3): release this capture's own buffers now, not with a global trim, which would touch
+                    // every other KFD-registered heap page and start the restore worker again.  Its storage is
+                    // ConversationBuffer segments (16 MiB, ordinary host memory that Strata never registers with the
+                    // GPU), so there is nothing to unregister.
+                    const size_t released = image.bytes();
+                    image = strata::core::SavedConversation{};   // its segments go to the pool (or unmapped past its cap)
+                    const size_t unmapped = strata::core::release_segment_pool(released);   // and back to the kernel
+                    ++memfix.postcheck_discards;
+                    memfix.released_bytes += released;
+                    std::fprintf(stderr, "strata serve: conversation cache: skip parking (RAM floor after capture: %lld MiB needed, %s; "
+                                         "capture discarded, %zu MiB freed, %zu MiB of pooled segments unmapped)\n",
+                                 (long long) o.conversation_cache_min_free_mib, ram_note(mem_after).c_str(), released >> 20,
+                                 unmapped >> 20);
+                    memfix_line("a park");
                     return true;
                 }
                 const size_t snapshot_bytes = image.bytes();
                 const bool stored = to_disk ? conv_disk.put(std::move(image)) : conversations.put(std::move(image), held);
+                if (stored) ++memfix.parks;
                 std::fprintf(stderr, "strata serve: conversation cache: %s %zu tokens in %.1f ms; parked=%zu bytes=%zu evictions=%zu snapshot_bytes=%zu reused_kv_bytes=%zu %s\n",
                              !stored ? "skipped" : to_disk ? "sent to the disk" : "parked", live.size(),
                              std::chrono::duration<double, std::milli>(Clock::now() - t0).count(),
                              conversations.size(), conversations.bytes(), conversations.evictions(), snapshot_bytes, reused_bytes,
                              strata::core::segment_pool_note().c_str());
+                memfix_line("a park");
             } catch (const std::bad_alloc&) {
                 // The active state has not been touched. Continue with normal
                 // prompt processing rather than killing a serving process.
                 std::fprintf(stderr, "strata serve: conversation cache: allocation failed; skip parking\n");
+                memfix_line("a park (allocation failed)");
             }
             return true;
         };
@@ -8634,6 +8688,7 @@ int main(int argc, char** argv) {
             try { return park_current_body(held); }
             catch (const std::bad_alloc&) {
                 std::fprintf(stderr, "strata serve: conversation cache: allocation failed; skip parking\n");
+                memfix_line("a park (allocation failed)");
                 return true;
             }
         };
@@ -11338,7 +11393,10 @@ int main(int argc, char** argv) {
             }
             if (!incoming && stream.id == 0 && parked.tokens > std::max(resume, slot_tokens))
                 incoming.emplace(conversations.take(parked.index));
-            if (incoming || stream.id) slot_source = -1;
+            if (incoming || stream.id) {
+                slot_source = -1;
+                ++memfix.restore_hits;
+            }
             // Reject the entire image before parking/overwriting the outgoing
             // state. Invalid entries can safely fall back to its existing prefix.
             if (incoming && incoming->stage_images.size() != stages.size()) {
@@ -11531,6 +11589,8 @@ int main(int argc, char** argv) {
                 std::fprintf(stderr, "strata serve: conversation cache: restored %lld tokens (%s) in %.1f ms; parked=%zu bytes=%zu\n",
                              (long long) resume, from_live ? "live" : "checkpoint", restore_ms,
                              conversations.size(), conversations.bytes());
+                ++memfix.restores;
+                memfix_line("a restore");
             }
             if (want_cvec != cvec_cached) {
                 live_ok = false;
