@@ -4,6 +4,7 @@
 #include "strata/core/spec_prob.hpp"
 #include "strata/core/on_device.hpp"
 #include "strata/core/progress.hpp"
+#include "strata/core/stream_registry.hpp"
 
 #include "strata/core/native_head.hpp"
 #include "strata/core/peer_experts.hpp"
@@ -148,6 +149,8 @@ MtpDrafter::~MtpDrafter() {
     if (h_cparams_) cudaFreeHost(h_cparams_);
     if (h_chist_) cudaFreeHost(h_chist_);
     if (h_q_) cudaFreeHost(h_q_);
+    strata::core::stream_unregister((void*) cs_);
+    strata::core::stream_unregister((void*) side_);
     if (cs_) cudaStreamDestroy(cs_);
     if (side_) cudaStreamDestroy(side_);
     if (sh_fork_) cudaEventDestroy(sh_fork_);
@@ -488,6 +491,12 @@ bool MtpDrafter::load(const std::string& rt_dir, const ModelGeometry& g, Session
         }
     }
 #endif
+    {   // request -1 diagnostics: the stall report queries these by name
+        int sdev = 0;
+        (void) cudaGetDevice(&sdev);
+        strata::core::stream_register((void*) cs_, "drafter (MTP) stream", sdev);
+        strata::core::stream_register((void*) side_, "drafter side stream", sdev);
+    }
     const double files_s = std::chrono::duration<double>(std::chrono::steady_clock::now() - t_files).count();
     if (shared != nullptr) {
         std::fprintf(stderr, "strata mtp: shared draft weights, %.0f MiB of private state and buffers\n",
@@ -1346,8 +1355,17 @@ void MtpDrafter::kv_restore(int64_t upto) {
     // the ring's blocks below `upto`, from the host copy: a checkpoint resume may have left later cells in them
     const strata::kernels::QsaShapes s = shapes_of(*g_);
     const int64_t b1 = (upto + s.page_size - 1) / s.page_size, b0 = std::max<int64_t>(0, b1 - st_.n_slots);
+    strata::core::DrafterRestore& note = strata::core::drafter_restore();   // request -1 diagnostics
+    note.b0.store(b0, std::memory_order_relaxed);
+    note.b1.store(b1, std::memory_order_relaxed);
+    note.count.fetch_add(1, std::memory_order_relaxed);
+    note.began_ms.store(strata::core::progress_now_ms(), std::memory_order_relaxed);
     strata::kernels::kv_ring_restore(qsa_attn_pools(st_), st_.host, qsa_kv_format(st_), b0, b1, st_.n_slots, s, cs_);
-    cudaStreamSynchronize(cs_);
+    const cudaError_t e = cudaStreamSynchronize(cs_);
+    note.ended_ms.store(strata::core::progress_now_ms(), std::memory_order_relaxed);
+    if (e != cudaSuccess)   // was ignored: now said (nothing else changes)
+        std::fprintf(stderr, "strata serve: the drafter's K/V restore (ring blocks %lld-%lld) returned %s\n",
+                     (long long) b0, (long long) b1, cudaGetErrorString(e));
 }
 
 bool MtpDrafter::prepare_prefill(std::string& err) {

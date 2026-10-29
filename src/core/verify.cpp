@@ -2,6 +2,7 @@
 #include "strata/core/batch_rows.hpp"
 #include "strata/kernels/gfx_arch.hpp"
 #include "strata/core/verify.hpp"
+#include "strata/core/stream_registry.hpp"
 #if !defined(STRATA_USE_HIP) && !defined(STRATA_HIP_GFX906)
 #include "strata/core/host_graph_launch.hpp"
 #endif
@@ -514,6 +515,9 @@ Verifier::~Verifier() {
     if (qcnt_) cudaFree(qcnt_);
     if (d_spec_) cudaFree(d_spec_);
     if (logit_bias_device_) cudaFree(logit_bias_device_);
+    if (cs_ != ext_stream_) strata::core::stream_unregister((void*) cs_);   // request -1 diagnostics
+    strata::core::stream_unregister((void*) sh_cs_);
+    strata::core::stream_unregister((void*) copy_);
     if (cs_ && cs_ != ext_stream_) cudaStreamDestroy(cs_);   // set_stream: the stage's stream, shared, not ours
     if (sh_cs_) cudaStreamDestroy(sh_cs_);
     if (copy_) { cudaStreamSynchronize(copy_); cudaStreamDestroy(copy_); }
@@ -771,6 +775,13 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
     if (cs_ == nullptr || cudaStreamCreateWithFlags(&sh_cs_, cudaStreamNonBlocking) != cudaSuccess) {
         err = "verify: stream create failed";
         return false;
+    }
+    {   // request -1 diagnostics: the stall report queries these by name (a shared stage stream is the stage's)
+        int sdev = 0;
+        (void) cudaGetDevice(&sdev);
+        if (cs_ != ext_stream_) strata::core::stream_register((void*) cs_, "verifier stream", sdev);
+        strata::core::stream_register((void*) sh_cs_, "verifier shared-expert stream", sdev);
+        strata::core::stream_register((void*) copy_, "verifier copy stream", sdev);
     }
     if (cudaEventCreateWithFlags(&commit_done_, cudaEventDisableTiming) != cudaSuccess ||
         cudaEventCreateWithFlags(&ev_fork_, cudaEventDisableTiming) != cudaSuccess ||

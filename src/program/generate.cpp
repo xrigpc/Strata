@@ -82,6 +82,7 @@
 #include "strata/program/batch_groups.hpp"
 #include "strata/kernels/cvec.hpp"
 #include "strata/core/progress.hpp"
+#include "strata/core/stream_registry.hpp"
 #include "strata/core/device.hpp"
 #include "strata/core/emulate.hpp"
 #ifndef NOMINMAX
@@ -1313,6 +1314,67 @@ constexpr int64_t kVramSafeMib =
     512;
 #endif
 
+/// request -1 diagnostics (xrig, output-neutral): the silent call the request is in, the drafter's last K/V restore,
+/// and whether each registered stream still has work.  The queries run on a thread of their own, bounded at 3 s: a
+/// query that does not come back is itself the finding (that stream's lock is held), and the watchdog's abort must
+/// not wait on it.
+void stream_report(std::FILE* f) {
+    const int64_t now = strata::core::progress_now_ms();
+    const strata::core::RequestStep& rs = strata::core::request_step();
+    std::fprintf(f, "  request sub-step: %s, for %lld ms\n", rs.what.load(), (long long) (now - rs.since_ms.load()));
+    const strata::core::DrafterRestore& dr = strata::core::drafter_restore();
+    if (const int64_t n = dr.count.load(); n > 0) {
+        const int64_t began = dr.began_ms.load(), ended = dr.ended_ms.load();
+        if (ended >= began)
+            std::fprintf(f, "  drafter K/V restore #%lld (ring blocks %lld-%lld): done in %lld ms, %lld ms ago\n",
+                         (long long) n, (long long) dr.b0.load(), (long long) dr.b1.load(), (long long) (ended - began),
+                         (long long) (now - ended));
+        else
+            std::fprintf(f, "  drafter K/V restore #%lld (ring blocks %lld-%lld): STILL WAITING on the drafter's stream "
+                            "after %lld ms\n", (long long) n, (long long) dr.b0.load(), (long long) dr.b1.load(),
+                         (long long) (now - began));
+    }
+    struct Out {
+        std::mutex mu;
+        std::condition_variable cv;
+        std::vector<std::string> lines;
+        bool done = false;
+    };
+    auto out = std::make_shared<Out>();
+    std::thread([out] {
+        strata::core::StreamSlot* slots = strata::core::stream_slots();
+        for (int i = 0; i < strata::core::kStreamSlots; ++i) {
+            void* const st = slots[i].stream.load(std::memory_order_acquire);
+            const char* const name = slots[i].name.load(std::memory_order_relaxed);
+            const int dev = slots[i].device.load(std::memory_order_relaxed);
+            if (st == nullptr || name == nullptr || dev < 0) continue;
+            {
+                std::lock_guard<std::mutex> lk(out->mu);
+                out->lines.push_back(std::string(name) + " (CUDA" + std::to_string(dev) + "): no answer within 3 s");
+            }
+            std::string r;
+            if (cudaSetDevice(dev) != cudaSuccess) {
+                r = "could not select its device";
+            } else {
+                const cudaError_t e = cudaStreamQuery((cudaStream_t) st);
+                r = e == cudaSuccess ? "idle" : e == cudaErrorNotReady ? "BUSY (work queued, not finished)"
+                                                                        : std::string("error: ") + cudaGetErrorString(e);
+            }
+            (void) cudaGetLastError();
+            std::lock_guard<std::mutex> lk(out->mu);
+            out->lines.back() = std::string(name) + " (CUDA" + std::to_string(dev) + "): " + r;
+        }
+        std::lock_guard<std::mutex> lk(out->mu);
+        out->done = true;
+        out->cv.notify_all();
+    }).detach();
+    std::unique_lock<std::mutex> lk(out->mu);
+    out->cv.wait_for(lk, std::chrono::seconds(3), [&] { return out->done; });
+    std::fprintf(f, "  streams (%zu registered%s):\n", out->lines.size(), out->done ? "" : ", the queries did not finish");
+    for (const std::string& l : out->lines) std::fprintf(f, "    %s\n", l.c_str());
+    std::fflush(f);
+}
+
 void stall_report(std::FILE* f, uint64_t layers_during) {
     strata::core::Progress& p = strata::core::progress();
     std::fprintf(f, "strata serve: stall report (engine %s): stage \"%s\" for %lld s; %llu layers served since the "
@@ -1326,6 +1388,7 @@ void stall_report(std::FILE* f, uint64_t layers_during) {
                      "smaller --max-context, or 'Prefer No Sysmem Fallback' for the engine in the NVIDIA control panel "
                      "(docs/DETAILS.md) leaves room");
     }
+    stream_report(f);   // request -1 diagnostics
     for (int pass = 0; pass < 2; ++pass) {
         if (pass == 1) {
             std::this_thread::sleep_for(std::chrono::seconds(2));
@@ -3269,6 +3332,11 @@ int main(int argc, char** argv) {
         return 1;
     }
     void* const main_cs = (void*) main_stream;
+    {
+        int sdev = 0;
+        (void) cudaGetDevice(&sdev);
+        strata::core::stream_register(main_cs, "main stream", sdev);   // request -1 diagnostics
+    }
 
     // ---- **THE HALF-LEVEL DUMP HAS TO BE ARMED BEFORE `session_capture`, AND THE LADDER MUST NOT BE.**  The
     // half copies are issued from inside `block_layer_pre`/`block_layer_post`, so they are only ever enqueued
@@ -3633,6 +3701,8 @@ int main(int argc, char** argv) {
             std::fprintf(stderr, "strata generate: layer split, CUDA%d: its streams failed\n", st.dev);
             return 1;
         }
+        strata::core::stream_register((void*) st.stream, "stage stream", st.dev);   // request -1 diagnostics
+        strata::core::stream_register((void*) st.adapt_stream, "stage refill stream", st.dev);
         // a control vector (the speed projection): its tables on this device too - the stage's layers apply it here
         if (!strata::kernels::cvec_replicate(err)) {
             std::fprintf(stderr, "strata generate: layer split, CUDA%d: %s\n", st.dev, err.c_str());
@@ -8872,6 +8942,11 @@ int main(int argc, char** argv) {
             std::fprintf(stderr, "strata serve: cannot create the refill stream\n");
             return 1;
         }
+        {
+            int sdev = 0;
+            (void) cudaGetDevice(&sdev);
+            strata::core::stream_register((void*) adapt_stream, "refill (adaptive tier) stream", sdev);   // request -1 diagnostics
+        }
         // plan v0.3 P6: swaps in flight - (residency index, slot) admitted when adapt_ev has completed
         std::vector<std::pair<int32_t, int32_t>> pending;
         int pending_age = 0;   // the windows the pending swaps have waited (adapt_lag)
@@ -10523,17 +10598,22 @@ int main(int argc, char** argv) {
                     strata::core::progress().allow_until_ms.store(0);
                     strata::core::progress().busy.store(true);
                     strata::core::progress_at("request");
+                    strata::core::request_step_at("request start");   // request -1 diagnostics
                 }
                 ~BusyScope() {
                     strata::core::progress().busy.store(false);
                     strata::core::progress().allow_until_ms.store(0);
                     strata::core::progress_at("idle");
+                    strata::core::request_step_at("idle");
                 }
             } busy_scope;
             {   // #2065: said, never changed - the free VRAM now (the verify windows' captures and the batch layouts
                 // eat into what startup reported), once per 128 MiB lower it gets
                 size_t vf_b = 0, vt_b = 0;
-                if (cudaMemGetInfo(&vf_b, &vt_b) == cudaSuccess) {
+                strata::core::request_step_at("the free-VRAM query (cudaMemGetInfo)");
+                const bool vf_ok = cudaMemGetInfo(&vf_b, &vt_b) == cudaSuccess;
+                strata::core::request_step_at("past the free-VRAM query");
+                if (vf_ok) {
                     const int64_t vf = (int64_t) (vf_b >> 20);
                     g_req_vram_free_mib.store(vf);
                     static int64_t low_said_at = INT64_MAX;
@@ -11016,6 +11096,7 @@ int main(int argc, char** argv) {
             // the last request's final commit may still be running on the verifier's stream (set_commit_async):
             // everything below reads, restores or zeroes the session from other streams and the host (the end of the
             // last request waited already; this covers a request that ended on an error path)
+            strata::core::request_step_at("the last request's commit wait (verifier stream)");
             if (!ver.wait_commit(err)) {
                 std::printf("ERR %s\n", err.c_str());
                 return 1;
@@ -11134,7 +11215,9 @@ int main(int argc, char** argv) {
                                  k + 1, (long long) (k < now.size() ? now[k].start : -1));
                 }
             }
+            strata::core::request_step_at("the RAM conversation cache lookup");
             auto parked = conversations.best(ids, req_imgs, want_cvec);
+            strata::core::request_step_at("past the RAM conversation cache lookup");
             std::optional<strata::core::SavedConversation> incoming;
             strata::core::ConversationDiskTier::Match stream;   // a disk conversation the RAM refuses whole (id 0: none)
             bool incoming_streamed = false;                      // incoming's K/V is already in the GPUs
@@ -11142,7 +11225,9 @@ int main(int argc, char** argv) {
             const size_t evictions_before = conversations.evictions();
             // the disk tier holds a longer prefix than the session, a --batch slot or the RAM cache: restore that one
             if (conv_disk.enabled()) {
+                strata::core::request_step_at("the disk conversation tier lookup");
                 const auto on_disk = conv_disk.best(ids, req_imgs, want_cvec);
+                strata::core::request_step_at("past the disk conversation tier lookup");
                 if (on_disk.tokens > std::max({resume, slot_tokens, parked.tokens})) {
                     const uint64_t floor = (uint64_t) o.conversation_cache_min_free_mib * 1024 * 1024;
                     size_t evicted = 0;
@@ -11442,7 +11527,8 @@ int main(int argc, char** argv) {
                     reread_to = resume;
                     std::fprintf(stderr, "strata serve: STRATA_CKPT_REREAD: reading %lld tokens again instead of "
                                          "restoring\n", (long long) resume);
-                } else if (c == nullptr || !checkpoint_restore(*c, ss, g) || c->stage_parts.size() != stages.size() ||
+                } else if ((strata::core::request_step_at("a checkpoint restore (device-wide syncs)"), c == nullptr) ||
+                           !checkpoint_restore(*c, ss, g) || c->stage_parts.size() != stages.size() ||
                            [&] {
                                for (size_t i = 0; i < stages.size(); ++i) {
                                    const strata::core::OnDevice on(stages[i]->dev);
@@ -11456,7 +11542,11 @@ int main(int argc, char** argv) {
             }
             // KV streaming: the drafter's ring may hold cells past `resume` from a longer turn; the main layers'
             // host copies and slots are always current (every writer writes both), so they need nothing
-            if (use_mtp && resume > 0 && reread_to <= 0) mtp.kv_restore(resume);
+            if (use_mtp && resume > 0 && reread_to <= 0) {
+                strata::core::request_step_at("the drafter's K/V restore (drafter stream sync)");
+                mtp.kv_restore(resume);
+            }
+            strata::core::request_step_at("past the drafter's K/V restore");
             tr("request", n, geni ? 1 : 0);
             if (use_mtp) mtp.set_prompt_len(n);
             const int64_t read_from = reread_to > 0 ? 0 : resume;

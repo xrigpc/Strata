@@ -1,5 +1,6 @@
 // src/prefill/prefill.cpp - see include/strata/prefill/prefill.hpp.
 #include "strata/prefill/prefill.hpp"
+#include "strata/core/stream_registry.hpp"
 #include <atomic>
 #if defined(__cpp_lib_atomic_wait)
 #define STRATA_ATOMIC_WAIT 1   // #1488: std::atomic::wait / notify_all are a GCC 11 library feature; GCC 10 spins instead
@@ -950,6 +951,8 @@ void Prefill::release() {
         if (impl_->ple_copied[b]) cudaEventDestroy(impl_->ple_copied[b]);
         if (impl_->ple_emb_host[b] && impl_->ple_pageable[b].empty()) cudaFreeHost(impl_->ple_emb_host[b]);
     }
+    strata::core::stream_unregister((void*) impl_->copy);   // request -1 diagnostics
+    strata::core::stream_unregister((void*) impl_->kv_copy);
     if (impl_->copy) cudaStreamDestroy(impl_->copy);
     if (impl_->kv_copy) cudaStreamDestroy(impl_->kv_copy);
     if (impl_->kv_released) cudaEventDestroy(impl_->kv_released);
@@ -1117,6 +1120,11 @@ bool Prefill::init(const core::WeightTable& wt, const core::ModelGeometry& g, co
         m.tok_up.init((size_t) chunk);
     }
     if (cudaStreamCreateWithFlags(&m.copy, cudaStreamNonBlocking) != cudaSuccess) { err = "prefill: copy stream"; return false; }
+    {
+        int sdev = 0;
+        (void) cudaGetDevice(&sdev);
+        strata::core::stream_register((void*) m.copy, "prompt path copy stream", sdev);   // request -1 diagnostics
+    }
     const size_t T = (size_t) chunk;
     m.T_max = chunk;
     m.borrowed = borrow != nullptr;
@@ -2103,11 +2111,17 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
     }();
     const bool kv_prefetch = kv_prefetch_on;
     if (kv_prefetch) {
+        const bool kv_copy_new = !m.kv_copy;
         if ((!m.kv_copy && cudaStreamCreateWithFlags(&m.kv_copy, cudaStreamNonBlocking) != cudaSuccess) ||
             (!m.kv_released && cudaEventCreateWithFlags(&m.kv_released, cudaEventDisableTiming) != cudaSuccess) ||
             (!m.kv_ready && cudaEventCreateWithFlags(&m.kv_ready, cudaEventDisableTiming) != cudaSuccess)) {
             err = "prefill: KV prefetch stream/events";
             return false;
+        }
+        if (kv_copy_new) {
+            int sdev = 0;
+            (void) cudaGetDevice(&sdev);
+            strata::core::stream_register((void*) m.kv_copy, "prompt path K/V prefetch stream", sdev);   // request -1 diagnostics
         }
     }
     // An early return must drain DMA before the caller refills the borrowed expert slots.
