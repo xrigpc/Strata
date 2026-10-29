@@ -247,6 +247,65 @@ int main() {
               "an oversized put drops nothing");
     }
     {
+        // xrig G1 (upstream #3711 part 1): take_superseded_reuse() hands the largest superseded copy's K/V pages to the
+        // next park (the same mappings, not a copy), drops every superseded copy, and keeps the byte accounting
+        auto cp = [](std::vector<int32_t> ids) { ConversationCheckpoint c; c.ids = std::move(ids); return c; };
+        auto with = [](std::vector<int32_t> prefix, std::initializer_list<int32_t> more) {
+            prefix.insert(prefix.end(), more);
+            return prefix;
+        };
+        auto first_page = [](const ConversationBuffer& b) {
+            const uint8_t* at = nullptr;
+            b.visit(0, 1, [&](const uint8_t* p, size_t, size_t) { at = p; return true; });
+            return at;
+        };
+        const size_t seg = ConversationBuffer::segment_bytes;
+        ConversationCache cache(size_t(1) << 30, 8);
+        SavedConversation other = image({1, 2, 3, 4, 50, 51, 52});   // another conversation: not superseded
+        other.checkpoints = {cp({1, 2, 3, 4}), cp({1, 2, 3, 4, 50, 51})};
+        check(cache.put(std::move(other)), "G1: park another conversation");
+        SavedConversation small = image({1, 2, 3, 4, 10, 11, 90});   // a superseded copy with little K/V
+        small.checkpoints = {cp({1, 2, 3, 4}), cp({1, 2, 3, 4, 10})};
+        small.kv.resize(1);
+        small.kv[0].k.resize(4096, 1);
+        check(cache.put(std::move(small)), "G1: park the small copy");
+        SavedConversation turn = image({1, 2, 3, 4, 10, 11, 12, 91});   // the copy a turn back, more K/V
+        turn.checkpoints = {cp({1, 2, 3, 4}), cp({1, 2, 3, 4, 10, 11})};
+        turn.kv.resize(2);
+        turn.kv[0].k.resize(seg + 4096, 7);                            // two segments
+        turn.kv[1].v.resize(seg, 8);
+        const uint8_t* k_at = first_page(turn.kv[0].k);
+        const uint8_t* v_at = first_page(turn.kv[1].v);
+        check(cache.put(std::move(turn)), "G1: park the copy a turn back");
+        check(cache.size() == 3 && cache.superseded() == 0, "G1: three parked, none superseded yet");
+        const size_t other_bytes = [&] {
+            SavedConversation probe = image({1, 2, 3, 4, 50, 51, 52});
+            probe.checkpoints = {cp({1, 2, 3, 4}), cp({1, 2, 3, 4, 50, 51})};
+            return probe.bytes();
+        }();
+        // the outgoing conversation's chain holds both copies' deepest checkpoints: both are superseded
+        const std::vector<int32_t> live = {1, 2, 3, 4, 10, 11, 12, 13, 14};
+        const std::vector<ConversationCheckpoint> chain = {cp({1, 2, 3, 4}), cp({1, 2, 3, 4, 10}),
+                                                           cp({1, 2, 3, 4, 10, 11}), cp({1, 2, 3, 4, 10, 11, 12, 13})};
+        auto got = cache.take_superseded_reuse(live, {}, chain, true);
+        check(got.dropped == 2 && cache.size() == 1 && cache.superseded() == 2,
+              "G1: both superseded copies go, the other conversation stays");
+        check(got.reuse.kv.size() == 2 && got.reuse.unchanged_tokens == 0 && got.reuse.captured_tokens == 8,
+              "G1: the larger copy is the donor; nothing counts as unchanged");
+        check(first_page(got.reuse.kv[0].k) == k_at && first_page(got.reuse.kv[1].v) == v_at &&
+                  got.reuse.kv[0].k.size() == seg + 4096,
+              "G1: the donor's own pages are handed over (same mappings, not copied)");
+        check(cache.bytes() == other_bytes, "G1: the cache counts only what it still holds");
+        check(cache.best(with(live, {15}), {}, true).tokens <= 4, "G1: only the root the other conversation shares is left");
+        // nothing superseded: no donor, nothing dropped
+        auto none = cache.take_superseded_reuse(live, {}, chain, true);
+        check(none.dropped == 0 && none.reuse.kv.empty() && cache.size() == 1, "G1: no superseded copy, no donor");
+        // the other steering mode is never a donor
+        auto steer = cache.take_superseded_reuse({1, 2, 3, 4, 50, 51, 52, 53}, {},
+                                                 {cp({1, 2, 3, 4}), cp({1, 2, 3, 4, 50, 51})}, false);
+        check(steer.dropped == 0 && steer.reuse.kv.empty() && cache.size() == 1, "G1: another cvec state is no donor");
+    }
+    {
         ConversationCache disabled(0,4), no_slots(1024,0);
         check(!disabled.enabled() && !no_slots.enabled(), "both disable switches");
         check(!disabled.put(image({1,2,3})) && !no_slots.put(image({1,2,3})), "disabled cache stores nothing");

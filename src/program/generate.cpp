@@ -8426,10 +8426,28 @@ int main(int argc, char** argv) {
                 return true;
             }
             // #342: before make_room evicts oldest-first, the copies of this conversation a turn back go (they hold
-            // nothing the outgoing chain does not, apart from the tail this conversation rewrote)
-            if (const size_t dropped = conversations.drop_superseded(live, live_imgs, checks, cvec_cached))
+            // nothing the outgoing chain does not, apart from the tail this conversation rewrote).
+            // xrig G1 (upstream #3711 part 1): with nothing retained, the largest superseded copy's K/V pages are
+            // kept and this park recopies into them, so the capture does not fault a fresh image (conv-buffer-mmap's
+            // per-turn cost).  STRATA_SUPERSEDED_REUSE=0 drops them as before.  checks is still whole here.
+            static const bool superseded_reuse = [] {
+                const char* v = std::getenv("STRATA_SUPERSEDED_REUSE");
+                return !(v != nullptr && v[0] == '0');
+            }();
+            strata::core::ConversationCache::SupersededReuse harvested;
+            size_t dropped = 0;
+            if (superseded_reuse && conversations.retained_bytes() == 0) {
+                harvested = conversations.take_superseded_reuse(live, live_imgs, checks, cvec_cached);
+                dropped = harvested.dropped;
+            } else {
+                dropped = conversations.drop_superseded(live, live_imgs, checks, cvec_cached);
+            }
+            if (dropped)
                 std::fprintf(stderr, "strata serve: conversation cache: dropped %zu superseded cop%s of this "
                              "conversation; parked=%zu\n", dropped, dropped == 1 ? "y" : "ies", conversations.size());
+            if (!harvested.reuse.kv.empty())
+                std::fprintf(stderr, "strata serve: conversation cache: kept %zu MiB of superseded K/V pages for this "
+                                     "park\n", harvested.reuse.bytes() >> 20);
             // A layer split parks one image per stage: the first stage's (with the draft layer's K/V) and one per
             // later stage (without it - the draft ring is saved once).  The checkpoints are MOVED apart into their
             // stage parts for the capture and put back together whichever way this ends (no running state copied).
@@ -8446,6 +8464,7 @@ int main(int argc, char** argv) {
             } merge_back{cs, checks, n_st > 0};
             const strata::core::ConversationView view{live, live_imgs, n_st > 0 ? cs.stage0 : checks, cvec_cached};
             auto reuse = conversations.take_reuse();
+            if (reuse.kv.empty() && !harvested.reuse.kv.empty()) reuse = std::move(harvested.reuse);   // xrig G1
             std::vector<strata::core::ConversationKvReuse> stage_reuse = std::move(reuse.stages);
             stage_reuse.resize(n_st);
             reuse.stages.clear();

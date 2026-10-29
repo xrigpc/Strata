@@ -317,28 +317,58 @@ public:
     // shares the system prompt's root with it), is kept.  Returns how many were dropped.
     size_t drop_superseded(const std::vector<int32_t>& ids, const std::vector<ConversationImageKey>& images,
                            const std::vector<ConversationCheckpoint>& checkpoints, bool cvec) {
-        auto held = [&](const ConversationCheckpoint& c) {
-            if (c.ids == ids && c.imgs == images) return true;
-            for (const auto& k : checkpoints)
-                if (k.ids == c.ids && k.imgs == c.imgs) return true;
-            return false;
-        };
         size_t dropped = 0;
         for (size_t i = 0; i < entries_.size();) {
-            const auto& e = entries_[i];
-            const ConversationCheckpoint* deepest = nullptr;
-            for (const auto& c : e.checkpoints)
-                if (!deepest || c.ids.size() > deepest->ids.size()) deepest = &c;
-            if (e.cvec == cvec && deepest && !deepest->ids.empty() && held(*deepest)) {
-                bytes_ -= e.bytes();
-                entries_.erase(entries_.begin() + (std::ptrdiff_t) i);
-                ++dropped;
-                continue;
-            }
-            ++i;
+            if (!superseded_entry(i, ids, images, checkpoints, cvec)) { ++i; continue; }
+            bytes_ -= entries_[i].bytes();
+            entries_.erase(entries_.begin() + (std::ptrdiff_t) i);
+            ++dropped;
         }
         superseded_ += dropped;
         return dropped;
+    }
+    // xrig G1 (port of upstream #3711 part 1, for #3321): the entries drop_superseded() would free, but the largest
+    // one's K/V segments are moved out first.  With conv-buffer-mmap every segment is its own mapping, so the next
+    // park's device-to-host copy used to fault every page of a fresh image; recopied into these pages it does not.
+    // All bytes are recopied (unchanged_tokens 0: equal token ids do not prove the K/V prefix).  `dropped` counts
+    // every superseded entry, the donor included.
+    struct SupersededReuse {
+        ConversationKvReuse reuse;
+        size_t dropped = 0;
+    };
+    SupersededReuse take_superseded_reuse(const std::vector<int32_t>& ids,
+                                          const std::vector<ConversationImageKey>& images,
+                                          const std::vector<ConversationCheckpoint>& checkpoints, bool cvec) {
+        SupersededReuse out;
+        size_t best = SIZE_MAX, best_kv = 0;
+        for (size_t i = 0; i < entries_.size(); ++i) {
+            if (!superseded_entry(i, ids, images, checkpoints, cvec)) continue;
+            size_t kvb = 0;
+            for (const auto& layer : entries_[i].kv) kvb += layer.bytes();
+            for (const auto& stage : entries_[i].stage_images)
+                for (const auto& layer : stage.kv) kvb += layer.bytes();
+            if (best == SIZE_MAX || kvb > best_kv) { best = i; best_kv = kvb; }
+        }
+        if (best != SIZE_MAX && best_kv > 0) {
+            auto& e = entries_[best];
+            const size_t before = e.bytes();
+            out.reuse.captured_tokens = (int64_t) e.live.ids.size();
+            out.reuse.unchanged_tokens = 0;
+            out.reuse.kv = std::move(e.kv);
+            e.kv.clear();
+            out.reuse.stages.reserve(e.stage_images.size());
+            for (auto& stage : e.stage_images) {
+                ConversationKvReuse part;
+                part.captured_tokens = out.reuse.captured_tokens;
+                part.unchanged_tokens = 0;
+                part.kv = std::move(stage.kv);
+                stage.kv.clear();
+                out.reuse.stages.push_back(std::move(part));
+            }
+            bytes_ -= before - e.bytes();   // the moved K/V no longer counts; the entry itself goes below
+        }
+        out.dropped = drop_superseded(ids, images, checkpoints, cvec);
+        return out;
     }
     size_t superseded() const { return superseded_; }
 
@@ -355,6 +385,20 @@ public:
 private:
     size_t budget_ = 0, slots_ = 0, bytes_ = 0, evictions_ = 0, superseded_ = 0;
     int64_t min_tokens_ = 0;   // --conversation-cache-min-tokens: 0 parks every conversation, whatever its size
+    bool superseded_entry(size_t i, const std::vector<int32_t>& ids, const std::vector<ConversationImageKey>& images,
+                          const std::vector<ConversationCheckpoint>& checkpoints, bool cvec) const {
+        if (i >= entries_.size()) return false;
+        const auto& e = entries_[i];
+        if (e.cvec != cvec) return false;
+        const ConversationCheckpoint* deepest = nullptr;
+        for (const auto& c : e.checkpoints)
+            if (!deepest || c.ids.size() > deepest->ids.size()) deepest = &c;
+        if (!deepest || deepest->ids.empty()) return false;
+        if (deepest->ids == ids && deepest->imgs == images) return true;
+        for (const auto& k : checkpoints)
+            if (k.ids == deepest->ids && k.imgs == deepest->imgs) return true;
+        return false;
+    }
     std::deque<SavedConversation> entries_; // least recently active first
     std::function<void(SavedConversation&&)> on_evict_;
     ConversationKvReuse reuse_;
