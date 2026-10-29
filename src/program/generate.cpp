@@ -10567,7 +10567,34 @@ int main(int argc, char** argv) {
             }
             // a command may touch the expert cache (a request lends slots, a K/V growth moves them, a session restore
             // quiesces it): a round of the asynchronous tier that the batch windows left in flight lands first
-            if (!adapt_tick(true)) {
+            // fix B1b (lab): this drain waits unbounded (the job, then its copies' events) before the request's
+            // BusyScope arms the watchdog - a field event (26-Oct) sat ~11 min here with the client connected.  Watched like a
+            // request from here.  A batch round already in flight keeps its own watch and stage (nothing changes then).
+            bool drained;
+            {
+                strata::core::Progress& pg_ = strata::core::progress();
+                const bool watch = !pg_.busy.load();
+                if (watch) {
+                    pg_.allow_until_ms.store(0);
+                    strata::core::progress_at("the adaptive tier's drain before a command");
+                    strata::core::request_step_at("the adaptive tier's drain before a command (fix B1b)");
+                    pg_.busy.store(true);
+                    // lab test hook (unset: nothing): when the named file exists, it is removed and this command stalls
+                    // for STRATA_TEST_ADAPT_DRAIN_STALL_MS (default 90000), once - the restarted engine is not stalled
+                    if (const char* tf = std::getenv("STRATA_TEST_ADAPT_DRAIN_STALL_FILE"))
+                        if (std::remove(tf) == 0) {
+                            const char* ts = std::getenv("STRATA_TEST_ADAPT_DRAIN_STALL_MS");
+                            std::this_thread::sleep_for(std::chrono::milliseconds(ts ? std::atoll(ts) : 90000));
+                        }
+                }
+                drained = adapt_tick(true);
+                if (watch) {
+                    pg_.busy.store(false);
+                    strata::core::progress_at("idle");
+                    strata::core::request_step_at("idle");
+                }
+            }
+            if (!drained) {
                 std::printf("ERR an adaptive refill failed\n");
                 return 1;
             }
@@ -12029,10 +12056,12 @@ int main(int argc, char** argv) {
                 return true;
             };
             apply_pending(true);
+            strata::core::request_step_at("the adaptive tier's drain in the request (fix B1b)");
             if (!adapt_tick(true)) {   // --adapt-async: the round in flight lands before the prompt lends any slot
                 std::printf("ERR an adaptive refill failed\n");
                 return 1;
             }
+            strata::core::request_step_at("past the adaptive tier's drain in the request");
             // per-request sampling for the verify window's head (greedy when temperature is absent)
             strata::kernels::SamplerParams req_sp;
             req_sp.greedy = req_temperature <= 0.0f;
