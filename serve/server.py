@@ -213,6 +213,27 @@ def focused_recovery_prompt(tok, ids, generated):
 LOOPBACK_NAMES = ("localhost", "127.0.0.1", "::1")
 QUEUE_BEAT_S = 10.0         # a request waiting for the single turn sends a keep-alive this often (#1619)
 KEEPALIVE_S = 10.0          # a held-back tool argument leaves the stream quiet: ping at least this often
+# xrig 2c (lab): a request whose engine ended before its answer began (fix B1's exit 75, a watchdog restart) is sent
+# once more to a freshly started engine instead of answered 503 - /v1/chat/completions only. STRATA_RETRY_BEFORE_ANSWER=0: off
+RETRY_BEFORE_ANSWER = 0 if os.environ.get("STRATA_RETRY_BEFORE_ANSWER", "1") == "0" else 1
+
+
+def _chunk_has_answer(c) -> bool:
+    """xrig 2c: a streamed chunk that carries part of the answer (text, reasoning or a tool call). The role opener and
+    prompt-progress chunks go out before the first token, so they do not end the chance to retry."""
+    try:
+        d = c["choices"][0].get("delta") or {}
+    except (KeyError, IndexError, TypeError, AttributeError):
+        return True                                       # not a delta chunk: treat it as part of the answer
+    return bool(d.get("content") or d.get("reasoning_content") or d.get("tool_calls"))
+
+
+def _chunk_is_role_opener(c) -> bool:
+    try:
+        d = c["choices"][0].get("delta") or {}
+    except (KeyError, IndexError, TypeError, AttributeError):
+        return False
+    return "role" in d and not _chunk_has_answer(c) and "prompt_progress" not in c
 CTX_SLACK = 8               # `strata --serve` rejects prompt + max_new + 8 > context: keep the same margin here
 # The live tok/s is a rate over a window, not a mean since the first token: a mean reads ~1/elapsed at the first
 # token (the Monitor showed five-digit numbers) and then undershoots for the first second of every answer.
@@ -5759,6 +5780,14 @@ def make_handler(svc: Service):
                   if shared else "[strata] other apps use their own settings again", flush=True)
             self._json(200, {"shared": bool(shared), "defaults": shared})
 
+        def _retry_before_answer(self, e):
+            """xrig 2c (lab): the engine ended before this request's answer began; the next attempt's prepare() starts
+            it again (as the next request would), so the client sees a slower answer instead of a 503."""
+            print(f"[strata] the engine ended before this request's answer began ({e}): starting it again and sending "
+                  "the request once more (xrig 2c)", flush=True)
+            self._note(retried_before_answer=str(e)[:300])
+            svc.drop_embeddings()                            # prepare() writes the request's images again
+
         def _sse(self):
             self._note(http_status=200)
             self.send_response(200)
@@ -5837,41 +5866,82 @@ def make_handler(svc: Service):
             check_request_sampling(req)                       # ... and a sampling field of the wrong type
             cancel = threading.Event()
             self._watch_client(cancel)                       # #430 #431 (#1999: before prepare, which can take long)
-            ids, thinking, max_new = svc.prepare(messages, tools, kw, max_new, force=force, req=req, cancel=cancel)
-            _debug_req("openai", req, messages, tools, max_new, thinking, len(ids))
-            run = run_with_mcp(svc, svc.mcp, messages, tools, kw, ids, thinking, max_new, max_req, req, cancel,
-                               {t["name"] for t in extra}) if use_mcp else None
-            chunks = openai_chunks(svc, req, ids, thinking, tools, max_new, cancel, run=run, force=force)
-            if validator is not None:
-                chunks = structured_chunks(chunks, validator)
-            chunks = self._capture(chunks, "openai")
+
+            def attempt():
+                ids, thinking, mx = svc.prepare(messages, tools, kw, max_new, force=force, req=req, cancel=cancel)
+                _debug_req("openai", req, messages, tools, mx, thinking, len(ids))
+                run = run_with_mcp(svc, svc.mcp, messages, tools, kw, ids, thinking, mx, max_req, req, cancel,
+                                   {t["name"] for t in extra}) if use_mcp else None
+                chunks = openai_chunks(svc, req, ids, thinking, tools, mx, cancel, run=run, force=force)
+                if validator is not None:
+                    chunks = structured_chunks(chunks, validator)
+                return self._capture(chunks, "openai")
+            tries = RETRY_BEFORE_ANSWER
+            chunks = attempt()
             if not req.get("stream"):
-                return self._json(200, openai_collect(chunks))
+                while True:
+                    try:
+                        return self._json(200, openai_collect(chunks))
+                    except EngineDied as e:                  # nothing is sent yet: the whole answer can come again
+                        if tries <= 0 or self.answer_started or cancel.is_set():
+                            raise
+                        tries -= 1
+                        self._retry_before_answer(e)
+                        chunks = attempt()
             self._sse()
-            try:
-                for c in chunks:
-                    if c is None:
-                        self.wfile.write(b": keep-alive\n\n")      # an SSE comment: clients ignore it
-                    else:
-                        self.wfile.write(b"data: " + json.dumps(c, ensure_ascii=False).encode() + b"\n\n")
-                    self.wfile.flush()
-                self.wfile.write(b"data: [DONE]\n\n")
-            except OSError:
-                self._note(outcome="disconnected")
-                cancel.set()                                 # client went away: stop the engine
-                chunks.close()
-            except EngineDied as e:                          # mid-stream: say so, then end the stream properly
-                err = {"error": {"type": "server_error", "message": f"{e}; the next request restarts it"}}
-                self._note(error=err["error"])
-                self.wfile.write(b"data: " + json.dumps(err).encode() + b"\n\ndata: [DONE]\n\n")
-            except StructuredOutputError as e:
-                err = {"error": {"type": "structured_output_failed", "code": "structured_output_failed", "message": str(e)}}
-                self._note(error=err["error"])
-                self.wfile.write(b"data: " + json.dumps(err).encode() + b"\n\ndata: [DONE]\n\n")
-            except ValueError as e:                          # the engine's ERR after the stream started: the
-                err = {"error": {"type": "server_error", "message": str(e)}}   # headers are sent, so no 400 now
-                self._note(error=err["error"])
-                self.wfile.write(b"data: " + json.dumps(err).encode() + b"\n\ndata: [DONE]\n\n")
+            sent = False                                     # part of the answer went out: from then on no retry
+            retried = False
+            stream_id = None                                 # xrig 2c v3: the completion id the client saw first
+            while True:
+                try:
+                    for c in chunks:
+                        if c is None:
+                            self.wfile.write(b": keep-alive\n\n")      # an SSE comment: clients ignore it
+                        else:
+                            began = _chunk_has_answer(c)
+                            if retried and not sent and not began and _chunk_is_role_opener(c):
+                                continue                     # the first attempt already sent the role opener
+                            if isinstance(c, dict) and "id" in c:
+                                if stream_id is None:
+                                    stream_id = c["id"]
+                                elif retried and c["id"] != stream_id:
+                                    c = dict(c, id=stream_id)    # xrig 2c v3: one id for the whole stream
+                            self.wfile.write(b"data: " + json.dumps(c, ensure_ascii=False).encode() + b"\n\n")
+                            sent = sent or began
+                        self.wfile.flush()
+                    self.wfile.write(b"data: [DONE]\n\n")
+                except OSError:
+                    self._note(outcome="disconnected")
+                    cancel.set()                             # client went away: stop the engine
+                    chunks.close()
+                except EngineDied as e:                      # mid-stream: say so, then end the stream properly
+                    if not sent and tries > 0 and not cancel.is_set():
+                        tries -= 1                           # xrig 2c: no token went out yet - start the engine
+                        retried = True
+                        self._retry_before_answer(e)         # again and send the request once more
+                        try:
+                            self.wfile.write(b": keep-alive\n\n")
+                            self.wfile.flush()
+                            chunks = attempt()
+                            continue
+                        except EngineDied as e2:
+                            e = e2
+                        except OSError:
+                            self._note(outcome="disconnected")
+                            cancel.set()
+                            break
+                    err = {"error": {"type": "server_error", "message": f"{e}; the next request restarts it"}}
+                    self._note(error=err["error"])
+                    self.wfile.write(b"data: " + json.dumps(err).encode() + b"\n\ndata: [DONE]\n\n")
+                except StructuredOutputError as e:
+                    err = {"error": {"type": "structured_output_failed", "code": "structured_output_failed", "message": str(e)}}
+                    self._note(error=err["error"])
+                    self.wfile.write(b"data: " + json.dumps(err).encode() + b"\n\ndata: [DONE]\n\n")
+                except ValueError as e:                      # the engine's ERR after the stream started: the
+                    err = {"error": {"type": "server_error", "message": str(e)}}   # headers are sent, so no 400 now
+                    self._note(error=err["error"])
+                    self.wfile.write(b"data: " + json.dumps(err).encode() + b"\n\ndata: [DONE]\n\n")
+                break
 
         def _responses_ready(self, req, events):
             """Send a finished Responses result that did not run on the engine."""

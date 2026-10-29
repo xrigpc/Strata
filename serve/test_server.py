@@ -1849,6 +1849,7 @@ class ClientHangUp(unittest.TestCase):
 class EngineDeath(unittest.TestCase):
     """Issue #27: a dead engine is an error (not "length"), and the next request starts it again."""
 
+    @mock.patch("serve.server.RETRY_BEFORE_ANSWER", 0)   # xrig 2c off: the old contract
     def test_error_then_restart(self):
         tok = ByteTokenizer()
         eng = DyingEngine(tok, "</think>\n\n" + ANSWER, max_context=CTX)
@@ -4720,14 +4721,77 @@ class LostStep(unittest.TestCase):
                     httpd.server_close()
                     eng.unload()
 
+    @mock.patch("serve.server.RETRY_BEFORE_ANSWER", 0)   # xrig 2c off: the old contract
     def test_silent_mid_answer(self):
         self.run_mode("silent", stream=False)
 
+    @mock.patch("serve.server.RETRY_BEFORE_ANSWER", 0)   # xrig 2c off: the old contract
     def test_silent_mid_stream(self):
         self.run_mode("silent", stream=True)
 
+    @mock.patch("serve.server.RETRY_BEFORE_ANSWER", 0)   # xrig 2c off: the old contract
     def test_stop_never_acknowledged(self):
         self.run_mode("stop", stream=False)
+
+
+class RetryBeforeAnswer(unittest.TestCase):
+    """xrig 2c: an engine that ends before the request's answer began is started again and the request sent once more,
+    so the client gets the answer instead of an error.  STRATA_RETRY_BEFORE_ANSWER=0 keeps the error (EngineDeath,
+    LostStep above)."""
+
+    def test_dead_engine_before_the_answer_is_retried(self):
+        tok = ByteTokenizer()
+        eng = DyingEngine(tok, "</think>\n\n" + ANSWER, max_context=CTX)
+        svc = Service(eng, tok, ChatTemplate(ROOT / "serve/chat_template.jinja"))
+        httpd = serve(svc, port=0)
+        base = f"http://127.0.0.1:{httpd.server_address[1]}"
+        try:
+            req = urllib.request.Request(base + "/v1/chat/completions",
+                                         data=json.dumps({"model": "m", "max_tokens": 50, "stream": True,
+                                                          "messages": [{"role": "user", "content": "hi"}]}).encode(),
+                                         headers={"Content-Type": "application/json"})
+            with urllib.request.urlopen(req, timeout=30) as r:
+                self.assertEqual(r.status, 200)
+                text = r.read().decode()
+            self.assertNotIn('"error"', text)
+            self.assertEqual(eng.restarts, 1)
+            self.assertEqual(text.count('"role": "assistant"'), 1, "the role opener went out twice")
+            chunks = [json.loads(x[6:]) for x in text.splitlines() if x.startswith("data: {")]
+            self.assertEqual(len({c["id"] for c in chunks if "id" in c}), 1, "the retried stream changed its id")
+            self.assertEqual(chunks[-1]["usage"]["completion_tokens"], 50)
+            self.assertTrue(text.rstrip().endswith("data: [DONE]"))
+        finally:
+            httpd.shutdown()
+
+    def test_silent_engine_before_the_answer_is_retried(self):
+        import serve.server as server
+        with tempfile.TemporaryDirectory() as d:
+            script, mark = Path(d) / "fake_strata.py", Path(d) / "lost"
+            script.write_text(FAKE_LOST_STEP, encoding="utf-8")
+            real = server.subprocess.Popen
+            with mock.patch.object(server.subprocess, "Popen",
+                                   lambda cmd, **kw: real([sys.executable, str(script), *cmd[1:]], **kw)):
+                eng = StrataEngine("strata", ["--mark", str(mark), "--mode", "silent"])
+                eng.silence_s = 0.5
+                tok = ByteTokenizer()
+                svc = Service(eng, tok, ChatTemplate(ROOT / "serve/chat_template.jinja"))
+                httpd = serve(svc, port=0)
+                base = f"http://127.0.0.1:{httpd.server_address[1]}"
+                body = {"model": "m", "max_tokens": 2, "reasoning_effort": "none", "stream": False,
+                        "messages": [{"role": "user", "content": "hi"}]}
+                try:
+                    first = eng.proc
+                    req = urllib.request.Request(base + "/v1/chat/completions", data=json.dumps(body).encode(),
+                                                 headers={"Content-Type": "application/json"})
+                    with urllib.request.urlopen(req, timeout=60) as r:
+                        text = r.read().decode()
+                    self.assertIsNot(eng.proc, first, "the silent engine was not replaced")
+                    self.assertIsNotNone(first.poll(), "the silent engine still runs")
+                    self.assertEqual(json.loads(text)["choices"][0]["message"]["content"], "ok")
+                finally:
+                    httpd.shutdown()
+                    httpd.server_close()
+                    eng.unload()
 
 
 class ImageSources(unittest.TestCase):
