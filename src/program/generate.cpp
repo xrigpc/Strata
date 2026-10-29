@@ -11544,7 +11544,31 @@ int main(int argc, char** argv) {
             // host copies and slots are always current (every writer writes both), so they need nothing
             if (use_mtp && resume > 0 && reread_to <= 0) {
                 strata::core::request_step_at("the drafter's K/V restore (drafter stream sync)");
-                mtp.kv_restore(resume);
+                if (!mtp.kv_restore(resume)) {
+                    // xrig fix B1: the copies are still queued on the drafter's stream, so nothing that waits on the
+                    // whole device (checkpoint restores, parks, teardown) can finish either.  Say where, and end the
+                    // engine at once - before this request's first token, so the server can start it again and the
+                    // client can retry - without the destructors (they synchronize) and without a core dump.
+                    // STRATA_MTP_RESTORE_HOLD_S=N (lab): hold N s first, so a root sidecar can read the queues.
+                    strata::core::request_step_at("the drafter's K/V restore TIMED OUT (fix B1)");
+                    stall_report(stderr, 0);
+                    static const int hold_s = [] {
+                        const char* v = std::getenv("STRATA_MTP_RESTORE_HOLD_S");
+                        return v ? std::atoi(v) : 0;
+                    }();
+                    if (hold_s > 0) {
+                        std::fprintf(stderr, "strata serve: holding %d s before ending the engine "
+                                             "(STRATA_MTP_RESTORE_HOLD_S)\n", hold_s);
+                        std::fflush(stderr);
+                        std::this_thread::sleep_for(std::chrono::seconds(hold_s));
+                    }
+                    strata::core::release_gpu_waits(stderr);   // #267, as the watchdog does
+                    std::fprintf(stderr, "strata serve: ending the engine after the drafter's K/V restore timed out "
+                                         "(fix B1, exit code 75) - the server starts it again\n");
+                    std::fflush(stderr);
+                    std::fflush(stdout);
+                    std::_Exit(75);   // EX_TEMPFAIL
+                }
             }
             strata::core::request_step_at("past the drafter's K/V restore");
             tr("request", n, geni ? 1 : 0);

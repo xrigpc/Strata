@@ -42,6 +42,7 @@
 #include <exception>
 #include <fstream>
 #include <sstream>
+#include <thread>
 #include <vector>
 #if defined(_WIN32)
 #include <intrin.h>
@@ -1349,9 +1350,9 @@ bool MtpDrafter::capture_step(int j, bool coupled, std::string& err) {
     return finish_capture(cs_, ok, exec, coupled ? "step (coupled)" : "step", err);
 }
 
-void MtpDrafter::kv_restore(int64_t upto) {
+bool MtpDrafter::kv_restore(int64_t upto) {
     const OnDevice on_device(device_);
-    if (st_.kv_mode != 2 || upto <= 0) return;
+    if (st_.kv_mode != 2 || upto <= 0) return true;
     // the ring's blocks below `upto`, from the host copy: a checkpoint resume may have left later cells in them
     const strata::kernels::QsaShapes s = shapes_of(*g_);
     const int64_t b1 = (upto + s.page_size - 1) / s.page_size, b0 = std::max<int64_t>(0, b1 - st_.n_slots);
@@ -1360,12 +1361,52 @@ void MtpDrafter::kv_restore(int64_t upto) {
     note.b1.store(b1, std::memory_order_relaxed);
     note.count.fetch_add(1, std::memory_order_relaxed);
     note.began_ms.store(strata::core::progress_now_ms(), std::memory_order_relaxed);
+    // test hook (STRATA_TEST_MTP_RESTORE_STALL_MS=N, lab only): the drafter's stream is held N ms before the copies,
+    // as when they never complete, so the bounded wait below can be seen to fire.  Unset: nothing.
+    static const int test_stall_ms = [] {
+        const char* v = std::getenv("STRATA_TEST_MTP_RESTORE_STALL_MS");
+        return v ? std::atoi(v) : 0;
+    }();
+    static int test_stall_arg = test_stall_ms;
+    if (test_stall_ms > 0)
+        cudaLaunchHostFunc(cs_, [](void* p) { std::this_thread::sleep_for(std::chrono::milliseconds(*(int*) p)); },
+                           &test_stall_arg);
     strata::kernels::kv_ring_restore(qsa_attn_pools(st_), st_.host, qsa_kv_format(st_), b0, b1, st_.n_slots, s, cs_);
-    const cudaError_t e = cudaStreamSynchronize(cs_);
+    // xrig fix B1: a bounded wait (event 4 hung here for good: the copies' completion never came)
+    static const int64_t wait_ms = [] {
+        const char* v = std::getenv("STRATA_MTP_RESTORE_WAIT_MS");
+        return v ? (int64_t) std::atoll(v) : (int64_t) 10000;
+    }();
+    cudaError_t e = cudaSuccess;
+    bool in_time = true;
+    if (wait_ms <= 0) {
+        e = cudaStreamSynchronize(cs_);
+    } else {
+        const int64_t t0 = strata::core::progress_now_ms();
+        for (int spins = 0;; ++spins) {
+            e = cudaStreamQuery(cs_);
+            if (e != cudaErrorNotReady) break;
+            if (strata::core::progress_now_ms() - t0 >= wait_ms) {
+                in_time = false;
+                break;
+            }
+            // the copies take a few ms: poll finely at first, then once a millisecond
+            std::this_thread::sleep_for(std::chrono::microseconds(spins < 100 ? 50 : 1000));
+        }
+        if (e == cudaErrorNotReady) e = cudaSuccess;   // the timeout is reported below, not as an error
+        (void) cudaGetLastError();
+    }
     note.ended_ms.store(strata::core::progress_now_ms(), std::memory_order_relaxed);
     if (e != cudaSuccess)   // was ignored: now said (nothing else changes)
         std::fprintf(stderr, "strata serve: the drafter's K/V restore (ring blocks %lld-%lld) returned %s\n",
                      (long long) b0, (long long) b1, cudaGetErrorString(e));
+    if (!in_time) {
+        std::fprintf(stderr, "strata serve: the drafter's K/V restore (ring blocks %lld-%lld) did not finish in %lld ms "
+                             "(STRATA_MTP_RESTORE_WAIT_MS; the request -1 stall class): the drafter's stream is not "
+                             "used again\n", (long long) b0, (long long) b1, (long long) wait_ms);
+        return false;
+    }
+    return true;
 }
 
 bool MtpDrafter::prepare_prefill(std::string& err) {
