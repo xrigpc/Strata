@@ -8377,7 +8377,15 @@ int main(int argc, char** argv) {
                 if (strata::core::conversation_memory_admit(mem ? std::optional<uint64_t>(mem->available) : std::nullopt,
                                                             need, floor))
                     return true;
-                if (!trimmed) { return_freed_heap(); trimmed = true; continue; }
+                if (!trimmed) {
+                    // xrig fix (21-Oct): pooled segment mappings first, but only the shortfall, so the rest of the
+                    // pool keeps captures fault-free; then malloc's freed heap
+                    const uint64_t want = need + floor, have = mem ? mem->available : 0;
+                    if (want > have) strata::core::release_segment_pool((size_t) (want - have));
+                    return_freed_heap();
+                    trimmed = true;
+                    continue;
+                }
                 if (conv_disk.pending()) {
                     // xrig tier fix: a bounded wait that beats.  A slow disk used to hold the request here for as
                     // long as its queued writes took (60 s stalls and a watchdog restart on a DRAM-less drive); past
@@ -8589,10 +8597,11 @@ int main(int argc, char** argv) {
                 }
                 const size_t snapshot_bytes = image.bytes();
                 const bool stored = to_disk ? conv_disk.put(std::move(image)) : conversations.put(std::move(image), held);
-                std::fprintf(stderr, "strata serve: conversation cache: %s %zu tokens in %.1f ms; parked=%zu bytes=%zu evictions=%zu snapshot_bytes=%zu reused_kv_bytes=%zu\n",
+                std::fprintf(stderr, "strata serve: conversation cache: %s %zu tokens in %.1f ms; parked=%zu bytes=%zu evictions=%zu snapshot_bytes=%zu reused_kv_bytes=%zu %s\n",
                              !stored ? "skipped" : to_disk ? "sent to the disk" : "parked", live.size(),
                              std::chrono::duration<double, std::milli>(Clock::now() - t0).count(),
-                             conversations.size(), conversations.bytes(), conversations.evictions(), snapshot_bytes, reused_bytes);
+                             conversations.size(), conversations.bytes(), conversations.evictions(), snapshot_bytes, reused_bytes,
+                             strata::core::segment_pool_note().c_str());
             } catch (const std::bad_alloc&) {
                 // The active state has not been touched. Continue with normal
                 // prompt processing rather than killing a serving process.
@@ -10748,8 +10757,13 @@ int main(int argc, char** argv) {
                         }
                         const uint64_t floor = (uint64_t) o.conversation_cache_min_free_mib << 20;
                         if (o.session_save_reclaim) {
+                            // xrig fix (21-Oct): an evicted conversation's segments go into the segment pool, so
+                            // the probe hands the pool back first or the RAM it reads would never rise (a save is rare)
                             const auto freed = strata::core::session_save_reclaim(
-                                checks, conversations, sl, floor, strata::core::available_host_bytes);
+                                checks, conversations, sl, floor, [] {
+                                    strata::core::release_segment_pool();
+                                    return strata::core::available_host_bytes();
+                                });
                             if (freed.bytes || freed.checkpoints || freed.parked) {
                                 // A removed tail must not mark a later checkpoint at this length as a tail.
                                 if (tail_ckpt_len >= 0 && std::none_of(checks.begin(), checks.end(), [&](const auto& c) {
