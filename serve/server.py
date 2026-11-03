@@ -49,6 +49,10 @@ import time
 import urllib.request
 import uuid
 from http.client import HTTPException
+try:
+    import resource                 # POSIX: the engine's core-file limit (xrig incident 3, ENGINE_CORE_KEEP)
+except ImportError:                 # Windows
+    resource = None
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Iterator, Protocol
@@ -384,6 +388,12 @@ class GpuBusy(RuntimeError):
         self.retry_after = retry_after
 
 
+class EngineReleasing(GpuBusy):
+    """xrig incident 1: a start waited RESTART_WAIT_S for the previous engine's VRAM and RAM to come back, and they did
+    not: the start is refused (a 503 with Retry-After, like GpuBusy) and the next request waits again.  restart() lets
+    it through instead of spending one of its tries on it."""
+
+
 def unload_wait(value, default: float) -> float:
     """#1997: the `wait` of POST /unload?wait=...: absent / 0 / false: 0 (answer "busy" at once, as before); 1 / true /
     yes: `default` seconds; a number of seconds above 1: that long (at most an hour)."""
@@ -547,6 +557,171 @@ def start_log_marks(log: str | None, offset: int) -> list:
 # nothing in the log).  Such a start is tried again after a short wait (STRATA_START_RETRIES, default 3; 0: never).
 TRANSIENT_START_MARKS = ("hsa_exception", "HSA_STATUS_ERROR", "hsaKmt")
 START_RETRIES = max(0, int(os.environ.get("STRATA_START_RETRIES", "3") or 0))
+
+# xrig incident 1 (node.3.2, 2-Nov): a start waits until the previous engine's memory is back.  The kernel gives a dead
+# engine's pinned RAM and VRAM back after the process has gone (the KFD teardown), so a start right after one ended saw
+# the old engine's memory still in use: its weight arena did not fit, or it loaded degraded.  Before every start the
+# previous engine must be gone, the engine's cards must show VRAM in use <= the reading before its first start +
+# RESTART_VRAM_SLACK_MIB, and MemAvailable must either cover what the last successful load took or have stopped rising
+# (other programs' use can keep it below that for good; the engine's own memory guard decides then).  Past
+# RESTART_WAIT_S the start is refused (EngineReleasing, a 503) and the next request waits again: a start never goes
+# into the old engine's memory.  STRATA_RESTART_WAIT_S=0: off.
+RESTART_WAIT_S = max(0.0, float(os.environ.get("STRATA_RESTART_WAIT_S", "120") or 0))
+RESTART_VRAM_SLACK_MIB = max(0, int(os.environ.get("STRATA_RESTART_VRAM_SLACK_MIB", "512") or 0))
+RESTART_KILL_GRACE_S = 12.0    # the previous engine still running this far into a wait: it is killed (SIGKILL)
+RESTART_POLL_S = 1.0           # between the readings of a wait (each one is logged)
+RESTART_SETTLE_S = 0.5         # the first start: two readings this far apart must not show memory still coming back
+RESTART_SETTLE_VRAM_MIB = 64   # ... VRAM in use falling by more than this,
+RESTART_SETTLE_RAM_MIB = 256   # ... or MemAvailable rising by more than this (also: a later start's "still rising")
+RESTART_KFD_WAIT_S = 30.0      # the first start: the longest wait for other /dev/kfd users while VRAM is not falling
+RESTART_FIRST_LOG_LINES = 10   # the first start's wait logs this many steps, then only how it ended
+# xrig incident 3 (node.3.2, 2-Nov): the engine runs with a soft core-file limit of 1.  With a piped core_pattern
+# (apport, systemd-coredump) the kernel ignores RLIMIT_CORE except the value 1, which aborts the dump (fs/coredump.c,
+# coredump_pipe: "RLIMIT_CORE is set to 1, aborting core"); with a file pattern, 1 byte is below the smallest dump.  So
+# a crash or a watchdog abort ends in seconds, where apport read a ~60 GB core for minutes while the dying process kept
+# its memory.  The engine stays dumpable: /proc/<pid> stays the user's, and gdb can still attach to a live one.  Not
+# covered: a "@socket" core_pattern (coredump_socket takes no limit).  The engine and the image encoder only (set right
+# after each starts, see no_core_dumps); the server keeps its own limit.  STRATA_ENGINE_CORE=keep: they keep the
+# server's limit (a lab PC that wants the cores).
+ENGINE_CORE_KEEP = os.environ.get("STRATA_ENGINE_CORE", "") == "keep"
+
+
+def no_core_dumps(proc) -> None:
+    """xrig incident 3 (see ENGINE_CORE_KEEP): give a process this server just started a soft core-file limit of 1,
+    the hard limit unchanged.  Set from here with prlimit, never in a preexec_fn: this server runs threads, and a
+    preexec_fn can deadlock the child between fork and exec.  Until it is set - the process's first moments, before
+    it has mapped anything large - a crash would still dump an ordinary core.  Linux only (prlimit); nothing when the
+    hard limit is already 0 (no core at all)."""
+    pid = getattr(proc, "pid", None)
+    if ENGINE_CORE_KEEP or resource is None or not hasattr(resource, "prlimit") or not isinstance(pid, int) or pid <= 0:
+        return                                           # (a stand-in process without a pid: nothing to set)
+    try:
+        hard = resource.getrlimit(resource.RLIMIT_CORE)[1]
+        if hard == resource.RLIM_INFINITY or hard >= 1:
+            resource.prlimit(pid, resource.RLIMIT_CORE, (1, hard))
+    except (OSError, ValueError) as e:                  # never fails the start: it keeps the server's limit
+        print(f"[strata] the core-file limit of pid {pid} could not be set ({e}); it keeps the server's", flush=True)
+
+
+def mem_available_mib() -> int | None:
+    """MemAvailable from /proc/meminfo, in MiB; None where it cannot be read (not Linux)."""
+    try:
+        with open("/proc/meminfo", encoding="ascii", errors="replace") as f:
+            for line in f:
+                if line.startswith("MemAvailable:"):
+                    return int(line.split()[1]) >> 10
+    except (OSError, ValueError, IndexError):
+        pass
+    return None
+
+
+def _card_vram_used(index: int, amd: bool) -> int | None:
+    """One card's VRAM in use, in bytes: amdgpu's mem_info_vram_used (the card HIP numbers `index`), or NVML's; None
+    when it cannot be read."""
+    try:
+        from serve.telemetry import amd_device_dir, gpu_reader
+        if amd:
+            dev = amd_device_dir(index)
+            if dev is None:
+                return None
+            with open(os.path.join(dev, "mem_info_vram_used"), encoding="ascii") as f:
+                return int(f.read().strip())
+        g = gpu_reader(index)
+        return g.read().get("mem_used") if g.ok() else None
+    except Exception:                    # no driver, no library, a card that went away: nothing to read
+        return None
+
+
+def vram_used_mib(env: dict | None) -> int | None:
+    """VRAM in use on the cards an engine started with `env` sees, in MiB: the ones HIP_VISIBLE_DEVICES (amdgpu) or
+    CUDA_VISIBLE_DEVICES (NVML) names, else every card found (AMD first).  None when one of them cannot be read."""
+    env = os.environ if env is None else env
+    for var, amd in (("HIP_VISIBLE_DEVICES", True), ("CUDA_VISIBLE_DEVICES", False)):
+        if env.get(var, "").strip():
+            try:
+                cards = [int(x) for x in env[var].split(",")]
+            except ValueError:                           # UUIDs and the like: not mapped here
+                return None
+            used = [_card_vram_used(i, amd) for i in cards]
+            return None if None in used else sum(used) >> 20
+    for amd in (True, False):
+        used = []
+        while len(used) < 16 and (u := _card_vram_used(len(used), amd)) is not None:
+            used.append(u)
+        if used:
+            return sum(used) >> 20
+    return None
+
+
+def memory_words(vram: int | None, avail: int | None, vram_max: int | None = None, need: int | None = None,
+                 bounds: bool = False) -> str:
+    """xrig incident 1: the readings of a start's wait, in words (with `bounds`: what each one must reach)."""
+    v = "VRAM not readable" if vram is None else f"VRAM used {vram} MiB"
+    if bounds and vram is not None:
+        v += " (no baseline)" if vram_max is None else f" (at most {vram_max} MiB)"
+    a = "MemAvailable not readable" if avail is None else f"MemAvailable {avail} MiB"
+    if bounds and avail is not None:
+        a += " (no load measured yet)" if need is None else f" (needs {need} MiB)"
+    return f"{v}, {a}"
+
+
+def kfd_holders() -> list[tuple[int, str, int]]:
+    """xrig incident 1: the processes this user can see that have /dev/kfd open, as (pid, name, parent pid); [] where
+    /proc cannot be read."""
+    out = []
+    try:
+        pids = [int(p) for p in os.listdir("/proc") if p.isdigit()]
+    except OSError:
+        return out
+    for pid in pids:
+        try:
+            fds = os.listdir(f"/proc/{pid}/fd")
+        except OSError:                                  # another user's, or gone
+            continue
+        for fd in fds:
+            try:
+                if os.readlink(f"/proc/{pid}/fd/{fd}") == "/dev/kfd":
+                    break
+            except OSError:
+                continue
+        else:
+            continue
+        try:
+            with open(f"/proc/{pid}/stat", encoding="ascii", errors="replace") as f:
+                text = f.read()
+            name = text[text.index("(") + 1:text.rindex(")")]
+            out.append((pid, name, int(text.rpartition(")")[2].split()[1])))
+        except (OSError, ValueError, IndexError):
+            continue
+    return out
+
+
+def other_kfd_users() -> list[tuple[int, str, int]]:
+    """xrig incident 1: the processes with /dev/kfd open other than this server and what it started (its replicas,
+    its image encoder) - the engine of a server before this one that is still exiting among them."""
+    me = os.getpid()
+    return [h for h in kfd_holders() if h[0] != me and h[2] != me]
+
+
+def process_alive(pid: int, start: str | None) -> bool:
+    """The process `pid` still runs: not gone, not a zombie, and (`start`: field 22 of its /proc stat, as read when it
+    was started) not a newer process with the same pid.  False where /proc cannot be read."""
+    try:
+        with open(f"/proc/{pid}/stat", encoding="ascii", errors="replace") as f:
+            fields = f.read().rpartition(")")[2].split()  # from field 3 (the state) on: the name may hold spaces
+    except OSError:
+        return False
+    return len(fields) > 19 and fields[0] not in ("Z", "X") and (start is None or fields[19] == start)
+
+
+def process_start(pid: int) -> str | None:
+    """Field 22 of /proc/<pid>/stat (the start time, in clock ticks since boot); None where it cannot be read."""
+    try:
+        with open(f"/proc/{pid}/stat", encoding="ascii", errors="replace") as f:
+            fields = f.read().rpartition(")")[2].split()
+        return fields[19] if len(fields) > 19 else None
+    except OSError:
+        return None
 
 
 def transient_start_failure(log: str | None, offset: int, elapsed_s: float, rc: int | None = None) -> bool:
@@ -813,6 +988,7 @@ class StrataEngine:
             self.info["version"] = None
         if lazy:
             return
+        self._wait_for_memory(log, env)                 # xrig incident 1: the previous engine's VRAM and RAM are back
         self.unloaded = False            # `ended` stays True until READY (below): not alive while starting (#344)
         self.log = open(log, "a", encoding="utf-8") if log else subprocess.DEVNULL
         loading = threading.Event()                     # set once READY: the narrator below stops
@@ -843,6 +1019,9 @@ class StrataEngine:
         self.proc = popen("the Strata engine", [exe, "--serve", *args], cwd=cwd, stdin=subprocess.PIPE,
                           stdout=subprocess.PIPE, stderr=self.log, text=True, encoding="utf-8", bufsize=1, env=env, **pin)
         contain(self.proc)                               # ends with the server, however it ends (Windows)
+        no_core_dumps(self.proc)                         # xrig incident 3
+        pid = getattr(self.proc, "pid", None)            # xrig incident 1: the next start's wait
+        self._gate["prev"] = (pid, process_start(pid)) if isinstance(pid, int) else None
         # the READY read has a timeout (#1317): the lines come from a thread, up to READY, so the rest of the stream
         # stays for _pump (one reader at a time)
         ready_q: queue.Queue = queue.Queue()
@@ -913,6 +1092,7 @@ class StrataEngine:
             raise EngineDied(why + (f" (see {log})" if log else "") + note +
                              start_failure_hint(log, log_start) + tail)
         self.known_ctx = self.max_context   # survives a failed restart: requests keep their limit and restart it
+        self._note_load(log)                            # xrig incident 1: the MemAvailable the next start needs
         # (from PR #41, midhatn) a locally built engine can sit next to another release's BUILD.json: engines that
         # report their own version (INFO engine=, 0.1.8+) win, the manifest stays the fallback for older ones
         if self.info.get("engine"):
@@ -1055,6 +1235,106 @@ class StrataEngine:
 
     RESTART_RETRY_S = 15.0   # between the tries of restart(): a dying engine's VRAM may take a while to come back
 
+    def _gate_note(self, log: str | None, text: str) -> None:
+        """xrig incident 1: a line of the wait, on the console and in the engine's log."""
+        print(f"[strata] {text}", flush=True)
+        if log:
+            try:
+                with open(log, "a", encoding="utf-8") as f:
+                    f.write(f"[strata] {time.strftime('%Y-%m-%d %H:%M:%S')} {text}\n")
+            except OSError:
+                pass
+
+    def _wait_for_memory(self, log: str | None, env: dict | None) -> None:
+        """xrig incident 1 (see RESTART_WAIT_S): before a start, wait until the previous engine's VRAM and RAM are back.
+        The first start of this engine object takes the baseline instead, once the readings have settled: a server that
+        Vertex started again can come up while the engine of the server before it is still being torn down.  Every
+        reading is logged.  EngineReleasing past RESTART_WAIT_S."""
+        g = self.__dict__.setdefault("_gate", {})       # restart() runs __init__ again: the figures stay
+        if "vram0" not in g:
+            vram, avail = vram_used_mib(env), mem_available_mib()
+            t0, logged = time.monotonic(), 0
+            while vram is not None and RESTART_WAIT_S > 0:
+                time.sleep(RESTART_SETTLE_S)
+                v, a = vram_used_mib(env), mem_available_mib()
+                coming_back = (v is not None and v < vram - RESTART_SETTLE_VRAM_MIB) or \
+                    (a is not None and avail is not None and a > avail + RESTART_SETTLE_RAM_MIB)
+                vram, avail = v, a
+                # a slow teardown can change less than the settle bounds: a process still on the GPU says so directly
+                others = other_kfd_users()
+                waited = time.monotonic() - t0
+                if (not coming_back and not others) or vram is None or waited >= RESTART_WAIT_S:
+                    break
+                if others and not coming_back and waited >= RESTART_KFD_WAIT_S:
+                    break                                # a GPU program that stays: VRAM is not falling, so no teardown
+                why = (", ".join(f"pid {p} ({n})" for p, n, _ in others) + " has /dev/kfd open") if others else \
+                    "memory is still coming back"
+                logged += 1
+                if logged <= RESTART_FIRST_LOG_LINES:
+                    more = "; further steps are not logged, the baseline line says when it ended" \
+                        if logged == RESTART_FIRST_LOG_LINES else ""
+                    self._gate_note(log, f"start: {why} ({memory_words(vram, avail)}): waiting before the first start "
+                                         f"({waited:.0f} of {RESTART_WAIT_S:.0f} s){more}")
+            g.update(vram0=vram, need=None, prev=None, avail_pre=avail)
+            seen = ""                                    # the /dev/kfd scan, with a GPU to scan for
+            if vram is not None:
+                users = [f"pid {p} ({n})" for p, n, _ in other_kfd_users()]
+                seen = f"; other /dev/kfd users: {', '.join(users) if users else 'none'}"
+            after = f" after {time.monotonic() - t0:.0f} s" if logged else ""
+            self._gate_note(log, f"start: baseline before the first start{after}: {memory_words(vram, avail)}{seen}")
+            return
+        t0, killed, steps, seen_avail = time.monotonic(), False, 0, []
+        while True:
+            vram, avail = vram_used_mib(env), mem_available_mib()
+            seen_avail.append(avail)
+            limit = None if g["vram0"] is None else g["vram0"] + RESTART_VRAM_SLACK_MIB
+            prev = g.get("prev")
+            running = prev is not None and process_alive(*prev)
+            waited = time.monotonic() - t0
+            vram_ok = vram is None or limit is None or vram <= limit
+            covered = avail is None or g["need"] is None or avail >= g["need"]
+            # below the need: start once MemAvailable has stopped rising (by more than RESTART_SETTLE_RAM_MIB over the
+            # last 2 polls) - what other programs hold is not coming back, and waiting for it would keep the engine down
+            last3 = seen_avail[-3:]
+            settled = len(last3) == 3 and None not in last3 and last3[-1] - last3[0] <= RESTART_SETTLE_RAM_MIB
+            seen = (memory_words(vram, avail, limit, g["need"], bounds=True) +
+                    (f", the previous engine (pid {prev[0]}) still runs" if running else ""))
+            if (vram_ok and (covered or settled) and not running) or RESTART_WAIT_S <= 0:
+                g["avail_pre"] = avail
+                after = f" after {waited:.0f} s" if steps else ""
+                if covered or RESTART_WAIT_S <= 0:
+                    self._gate_note(log, f"start: memory back{after}: {seen}")
+                else:
+                    self._gate_note(log, f"start: RAM settled at {avail} MiB, below the last load's need {g['need']} "
+                                         f"MiB{after}; starting, the engine's memory guard decides ({seen})")
+                return
+            if waited >= RESTART_WAIT_S:
+                self._gate_note(log, f"start refused: the previous engine's memory is not back after {waited:.0f} s: "
+                                     f"{seen}")
+                raise EngineReleasing(f"the previous engine's memory is not back after {waited:.0f} s ({seen}): the "
+                                      "engine was not started into it; the next request waits again", retry_after=15)
+            self._gate_note(log, f"start: waiting for the previous engine's memory ({waited:.0f} of "
+                                 f"{RESTART_WAIT_S:.0f} s): {seen}")
+            steps += 1
+            if running and not killed and waited >= RESTART_KILL_GRACE_S and hasattr(signal, "SIGKILL"):
+                killed = True
+                try:
+                    os.kill(prev[0], signal.SIGKILL)
+                    self._gate_note(log, f"start: the previous engine (pid {prev[0]}) was still running after "
+                                         f"{RESTART_KILL_GRACE_S:.0f} s: killed")
+                except OSError:
+                    pass
+            time.sleep(RESTART_POLL_S)
+
+    def _note_load(self, log: str | None = None) -> None:
+        """xrig incident 1: at READY, the MemAvailable this load took - what the next start waits to have."""
+        g = self.__dict__.get("_gate")
+        now = mem_available_mib()
+        if g is not None and g.get("avail_pre") is not None and now is not None:
+            g["need"] = max(0, g["avail_pre"] - now)
+            self._gate_note(log, f"start: this load took {g['need']} MiB of MemAvailable ({g['avail_pre']} -> {now} "
+                                 "MiB); the next start waits for that much, or for RAM to settle")
+
     @staticmethod
     def _ready_pump(proc, out: queue.Queue) -> None:
         """The engine's first lines up to READY, for a read that can time out; None when its output closed first."""
@@ -1088,6 +1368,8 @@ class StrataEngine:
                 try:
                     self.__init__(*self.spawn)
                     break
+                except EngineReleasing:          # xrig incident 1: the wait for memory is not one of the tries
+                    raise
                 except RuntimeError:
                     try:
                         self.proc.wait(timeout=60)
@@ -2283,6 +2565,7 @@ class Vision:
                           stderr=log or subprocess.DEVNULL, text=True, encoding="utf-8", bufsize=1, env=env,
                           cwd=self.dir)
         contain(self.proc)
+        no_core_dumps(self.proc)                         # xrig incident 3
         try:
             line = self._readline(VISION_READY_S, "the vision encoder did not start")
         except RuntimeError as e:                       # silent for VISION_READY_S: it was ended, and it is not left half-started
